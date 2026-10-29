@@ -1,0 +1,14 @@
+# Ignore everything at the top level only
+/*
+!/.gitignore
+
+# Whitelist the things you want to track
+!/app
+!/Code
+!/phonostethos_cheatsheet.md
+
+# Inside app/, still ignore build artifacts and generated files
+/app/build/
+/app/.dart_tool/
+/app/.flutter-plugins-dependencies
+/app/linux/flutter/ephemeral/
