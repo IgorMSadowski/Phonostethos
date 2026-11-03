@@ -1,0 +1,23 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			phonostethos-status-leds {
+				compatible = "phonostethos,status-leds";
+				heart-gpios = <&gpio 17 GPIO_ACTIVE_HIGH>;
+				lung-gpios = <&gpio 27 GPIO_ACTIVE_HIGH>;
+				recording-gpios = <&gpio 22 GPIO_ACTIVE_HIGH>;
+				general-gpios = <&gpio 24 GPIO_ACTIVE_HIGH>;
+				status = "okay";
+			};
+		};
+	};
+};

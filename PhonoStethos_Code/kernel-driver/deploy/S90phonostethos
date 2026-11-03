@@ -1,0 +1,47 @@
+#!/bin/sh
+
+DAEMON=/usr/bin/phonostethos-server
+PIDFILE=/var/run/phonostethos-server.pid
+STORAGE=/media/usb_storage
+MODULE=/lib/modules/$(uname -r)/extra/phonostethos_leds.ko
+
+case "$1" in
+    start)
+        if [ ! -x "$DAEMON" ]; then
+            echo "PhonoStethos server is not installed: $DAEMON" >&2
+            exit 1
+        fi
+        if ! grep -q '^phonostethos_leds ' /proc/modules; then
+            if [ ! -f "$MODULE" ] || ! insmod "$MODULE"; then
+                echo "Could not load the PhonoStethos LED driver from $MODULE" >&2
+                exit 1
+            fi
+        fi
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            exit 0
+        fi
+        "$DAEMON" --bind 10.42.0.3 --port 8080 --storage "$STORAGE" &
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null || true
+            i=0
+            while kill -0 "$(cat "$PIDFILE")" 2>/dev/null && [ "$i" -lt 50 ]; do
+                sleep 0.1
+                i=$((i + 1))
+            done
+            rm -f "$PIDFILE"
+        fi
+        rmmod phonostethos_leds 2>/dev/null || true
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac
+exit 0

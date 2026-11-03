@@ -152,6 +152,10 @@ ping -c 3 10.42.0.3
 sudo nmcli connection up phonostethos-usb
 ```
 
+fizemos isso:sudo ip route add 10.42.0.3/32 dev enx020000000001
+
+Depois isso:
+sudo nmcli connection add type ethernet ifname enx020000000001 con-name phonostethos-usb ipv4.method manual ipv4.addresses 10.42.0.10/24 ipv4.routes "10.42.0.3/32" ipv6.method ignore connection.autoconnect yes
 ### "Permission denied" na password
 ```bash
 # O sshd_config não está a permitir root com password

@@ -1,0 +1,45 @@
+#pragma once
+
+#include "phonostethos/CircularBuffer.h"
+#include "phonostethos/RuntimeTypes.h"
+
+#include <fftw3.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+namespace phono_app {
+class DspProcessor {
+public:
+    DspProcessor() = default;
+    ~DspProcessor();
+
+    DspProcessor(const DspProcessor&) = delete;
+    DspProcessor& operator=(const DspProcessor&) = delete;
+
+    bool initialize();
+    void reset();
+    void process_live(const std::int16_t* input, std::int16_t* output,
+                      std::size_t count, unsigned mode, unsigned gain);
+    std::optional<Telemetry> analyze(const std::int16_t* samples,
+                                     std::size_t count);
+
+private:
+    static std::pair<double, double> filter_limits(unsigned mode);
+
+    CircularBuffer<float, kFftFrames> history_;
+    std::array<float, kFftFrames> fft_input_{};
+    std::array<float, kFftFrames> waveform_{};
+    std::array<fftwf_complex, kFftFrames / 2 + 1> fft_output_{};
+    fftwf_plan fft_plan_ = nullptr;
+    double previous_x1_ = 0.0;
+    double previous_x2_ = 0.0;
+    double previous_y1_ = 0.0;
+    double previous_y2_ = 0.0;
+    unsigned configured_mode_ = 99;
+    std::size_t frames_since_fft_ = 0;
+};
+}  // namespace phono_app

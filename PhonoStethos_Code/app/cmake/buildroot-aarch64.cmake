@@ -1,0 +1,18 @@
+set(BUILDROOT_DIR "/home/igor/buildroot/buildroot-2026.08" CACHE PATH
+    "Buildroot source and output directory")
+set(BUILDROOT_HOST "${BUILDROOT_DIR}/output/host")
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_C_COMPILER "${BUILDROOT_HOST}/bin/aarch64-linux-gcc")
+set(CMAKE_CXX_COMPILER "${BUILDROOT_HOST}/bin/aarch64-linux-g++")
+set(CMAKE_SYSROOT
+    "${BUILDROOT_HOST}/aarch64-buildroot-linux-gnu/sysroot")
+set(CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${CMAKE_SYSROOT}")
+set(ENV{PKG_CONFIG_LIBDIR}
+    "${CMAKE_SYSROOT}/usr/lib/pkgconfig:${CMAKE_SYSROOT}/usr/share/pkgconfig")

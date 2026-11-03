@@ -1,0 +1,66 @@
+# PhonoStethos
+
+The source tree separates the Raspberry Pi kernel driver, C++ application, and
+Flutter host client:
+
+```text
+kernel-driver/
+  Makefile
+  phonostethos_leds.c
+app/
+  CMakeLists.txt
+  include/phonostethos/
+  src/
+gui/
+  phonostethos_gui/
+```
+
+## Application
+
+The C++ server uses ALSA for PCM I/O, FFTW3f for the spectrum, libsndfile for
+WAV files, and the custom LED character device. It processes mono PCM16 at
+8 kHz in 512-sample periods.
+
+Install the ALSA, FFTW3f, and libsndfile development packages, then build and
+test the protocol and queue utilities:
+
+```sh
+cmake -S app -B app/build
+cmake --build app/build
+ctest --test-dir app/build --output-on-failure
+```
+
+Use the root `Makefile` to build the Pi application and kernel module against
+the configured Buildroot toolchain and kernel tree.
+
+## Kernel driver
+
+The driver source is `kernel-driver/phonostethos_leds.c`. Build it against the
+exact target kernel headers with:
+
+```sh
+make -C kernel-driver KDIR=/path/to/linux \
+  CROSS_COMPILE=/path/to/toolchain/bin/aarch64-linux- ARCH=arm64
+```
+
+The root `Makefile` also compiles and stages the device-tree overlay, udev
+permissions, and init script. The LED mask is HEART `0x01` / BCM17, LUNG
+`0x02` / BCM27, GENERAL `0x04` / BCM24, and recording `0x08` / BCM22.
+
+## Flutter host
+
+```sh
+cd gui/phonostethos_gui
+flutter pub get
+flutter analyze
+flutter test
+flutter run -d linux
+```
+
+The GUI connects to the Pi at `10.42.0.3:8080`; configure the host USB Ethernet
+interface as `10.42.0.10/24`. The connection is local and does not require an
+Internet gateway.
+
+The GUI is a prototype dashboard, not a medical diagnostic instrument.
+Audio-device behavior, USB storage hot-plug, GPIO wiring, and acoustic
+performance still require on-device validation.

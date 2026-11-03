@@ -4,7 +4,7 @@
 
 # Whitelist the things you want to track
 !/app
-!/Code
+!/PhonoStethos_Code
 !/phonostethos_cheatsheet.md
 
 # Inside app/, still ignore build artifacts and generated files

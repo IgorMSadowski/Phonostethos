@@ -1,0 +1,13 @@
+app/build/
+app/build-pi/
+app/CMakeFiles/
+app/CMakeCache.txt
+kernel-driver/*.o
+kernel-driver/*.ko
+kernel-driver/*.mod
+kernel-driver/*.mod.c
+kernel-driver/*.mod.o
+kernel-driver/Module.symvers
+kernel-driver/modules.order
+gui/phonostethos_gui/.dart_tool/
+gui/phonostethos_gui/build/
