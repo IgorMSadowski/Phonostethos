@@ -1,8 +1,6 @@
 #!/bin/sh
 
 STORAGE=/media/usb_storage
-EXFAT_MODULE=/lib/modules/$(uname -r)/kernel/fs/exfat/exfat.ko
-UTF8_MODULE=/lib/modules/$(uname -r)/kernel/fs/nls/nls_utf8.ko
 LOCK=/run/phonostethos-usb-mount.lock
 
 log() {
@@ -55,23 +53,10 @@ if ! mkdir -p "$STORAGE"; then
     exit 1
 fi
 
-if ! grep -qw exfat /proc/filesystems; then
-    if [ -f "$UTF8_MODULE" ] && ! grep -qw nls_utf8 /proc/modules; then
-        if ! insmod "$UTF8_MODULE"; then
-            log "could not load the UTF-8 charset module"
-        fi
-    fi
-    if [ -f "$EXFAT_MODULE" ] && ! insmod "$EXFAT_MODULE"; then
-        log "could not load the exFAT filesystem module"
-    fi
+if mount -o rw,nosuid,nodev,noexec -t vfat "$DEVNAME" "$STORAGE"; then
+    log "mounted $DEVNAME (FAT32) at $STORAGE"
+    exit 0
 fi
 
-for filesystem in exfat vfat; do
-    if mount -o rw,nosuid,nodev,noexec -t "$filesystem" "$DEVNAME" "$STORAGE"; then
-        log "mounted $DEVNAME ($filesystem) at $STORAGE"
-        exit 0
-    fi
-done
-
-log "could not mount $DEVNAME; supported formats are exFAT and FAT32"
+log "could not mount $DEVNAME; supported format is FAT32"
 exit 1

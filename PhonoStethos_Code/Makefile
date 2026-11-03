@@ -39,10 +39,6 @@ install: build driver overlay
 		$(OVERLAY_DIR)/usr/bin/phonostethos-server
 	install -D -m 0644 kernel-driver/phonostethos_leds.ko \
 		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/extra/phonostethos_leds.ko
-	install -D -m 0644 $(KERNEL_DIR)/fs/exfat/exfat.ko \
-		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/kernel/fs/exfat/exfat.ko
-	install -D -m 0644 $(KERNEL_DIR)/fs/nls/nls_utf8.ko \
-		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/kernel/fs/nls/nls_utf8.ko
 	install -D -m 0644 $(DTB_OUTPUT) \
 		$(OVERLAY_DIR)/boot/overlays/phonostethos-status-leds.dtbo
 	install -D -m 0644 kernel-driver/phonostethos-leds.rules \
