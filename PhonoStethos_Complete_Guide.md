@@ -922,7 +922,7 @@ the final hardware.
 | FFT | 1024-sample history, Hann window, frequency spectrum | The code uses a 1024-point FFT with Hann weighting for spectrum and sends 512 magnitude bins. It omits the 513th real-FFT bin. |
 | Main/network threading | Report describes separate `th_Main` and `th_Network`, with command/result dispatch through a `MainMessage` queue | There is no `MainMessage` type or distinct Network worker. `main()` calls `NetworkManager::run()` on the main thread; it accepts and serves one client directly. |
 | Thread count | Report specifies four primary threads: Main, AudioDSP, FileIO, Network | Current baseline is main/network together, AudioEngine worker, and FileIO worker. Playback starts an additional file-reader thread. Audio requests core 1/FIFO 80; FileIO does not request core 2/FIFO 50; Network has no dedicated core. |
-| Command routing | Report assigns validation/state transitions to Main and workers, with asynchronous results through a shared queue | `serve_client` decodes a command and calls `handle_command` synchronously. It pushes then immediately pops `CommandQueue` in that same call path; this is not cross-thread dispatch. |
+| Command decoding and routing | Report's NetworkManager receives/assembles five command bytes and decodes them into a `CommandPacket`; Main then validates/routes the decoded command and coordinates worker requests/results. | `serve_client` calls `decode_command` and then calls `handle_command` itself. So the current NetworkManager performs both byte-level decoding and command decisions; there is no separate Main command dispatcher. It pushes then immediately pops `CommandQueue` in that same call path; this is not cross-thread dispatch. |
 | Pending results | Report allows `ACCEPTED_PENDING` followed by a final result | `Result::AcceptedPending` is defined and decoded, but current C++ command paths return completed/rejected/failed after their synchronous work; no path was found that emits AcceptedPending. |
 | Recording buffer | Report describes a synchronized 4096-sample circular recording buffer shared with FileIO | Current `CircularBuffer` is a plain, non-thread-safe FFT history buffer. Recording blocks are copied into `FileIOManager`'s mutex-protected deque; `kMaxPendingAudioBlocks` is 7. Queue overload stops recording and reports an overrun instead of silently overwriting. |
 | `DataQueue` | The report's architecture guide calls it a telemetry/display-snapshot queue | In the source, `DataQueue` is the eight-block playback-audio queue used by `AudioEngine`. Telemetry is one shared `Telemetry` snapshot protected by a mutex. |
@@ -938,9 +938,10 @@ the final hardware.
 ### The most important architectural differences
 
 The formal report and the explanation guide describe a planned ownership model:
-Network receives and queues a request, Main validates it, specialized workers
-perform operations, and Main commits the final state. The checked-in implementation
-is simpler and more synchronous:
+Network assembles and decodes the wire command into a `CommandPacket`, then queues
+it; Main validates and routes that command, specialized workers perform operations,
+and Main commits the final state. The checked-in implementation is simpler and more
+synchronous:
 
 - `NetworkManager::run` and `serve_client` execute on the original main thread.
 - `handle_command` performs command work directly from `serve_client`.
