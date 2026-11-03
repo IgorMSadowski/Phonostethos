@@ -28,20 +28,22 @@
 #include <unistd.h>
 #include <vector>
 
+using namespace std;
+
 namespace phono_app {
-std::atomic<bool> running{true};
+atomic<bool> running{true};
 
 bool storage_ready(const Options& options) {
-    std::error_code error;
-    if (!std::filesystem::is_directory(options.storage, error) || error) {
+    error_code error;
+    if (!filesystem::is_directory(options.storage, error) || error) {
         return false;
     }
     if (!options.require_mounted_storage) return true;
-    std::ifstream mounts("/proc/self/mounts");
+    ifstream mounts("/proc/self/mounts");
     if (!mounts) return false;
-    std::string line, device, mountpoint;
-    while (std::getline(mounts, line)) {
-        std::istringstream fields(line);
+    string line, device, mountpoint;
+    while (getline(mounts, line)) {
+        istringstream fields(line);
         if (fields >> device >> mountpoint &&
             mountpoint == options.storage.string()) {
             return true;
@@ -60,9 +62,9 @@ void handle_signal(int) {
 
 bool parse_options(int argc, char** argv, Options& options) {
     for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
+        const string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Usage: phonostethos-server [--bind IPv4] [--port PORT] "
+            cout << "Usage: phonostethos-server [--bind IPv4] [--port PORT] "
                          "[--capture-pcm NAME] [--playback-pcm NAME] "
                          "[--storage PATH] [--led-device PATH] "
                          "[--allow-unmounted-storage]\n";
@@ -73,10 +75,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             continue;
         }
         if (i + 1 >= argc) {
-            std::cerr << "Missing value for " << arg << '\n';
+            cerr << "Missing value for " << arg << '\n';
             return false;
         }
-        const std::string value = argv[++i];
+        const string value = argv[++i];
         if (arg == "--bind") {
             options.bind_address = value;
         } else if (arg == "--capture-pcm") {
@@ -89,14 +91,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.led_device = value;
         } else if (arg == "--port") {
             try {
-                const auto port = std::stoul(value);
+                const auto port = stoul(value);
                 if (port == 0 || port > 65535) return false;
-                options.port = static_cast<std::uint16_t>(port);
-            } catch (const std::exception&) {
+                options.port = static_cast<uint16_t>(port);
+            } catch (const exception&) {
                 return false;
             }
         } else {
-            std::cerr << "Unknown option: " << arg << '\n';
+            cerr << "Unknown option: " << arg << '\n';
             return false;
         }
     }
@@ -109,17 +111,17 @@ bool parse_options(int argc, char** argv, Options& options) {
 int main(int argc, char** argv) {
     Options options;
     if (!parse_options(argc, argv, options)) {
-        return argc > 1 && std::string(argv[1]) == "--help" ? 0 : 2;
+        return argc > 1 && string(argv[1]) == "--help" ? 0 : 2;
     }
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     SystemController runtime(options);
     if (!runtime.led_driver.open()) {
-        std::cerr << "LED status outputs are unavailable; continuing without LEDs\n";
+        cerr << "LED status outputs are unavailable; continuing without LEDs\n";
     }
     runtime.update_leds();
-    runtime.audio = std::make_unique<AudioEngine>(
+    runtime.audio = make_unique<AudioEngine>(
         options, runtime.mode, runtime.gain, runtime.recording,
         runtime.error_code, runtime.telemetry, runtime.configuration_mutex,
         runtime.telemetry_mutex,
@@ -131,7 +133,7 @@ int main(int argc, char** argv) {
     runtime.recording.store(false);
     runtime.audio->stop();
     if (!runtime.writer.finish_and_wait()) {
-        std::cerr << "Recording did not finalize cleanly during shutdown\n";
+        cerr << "Recording did not finalize cleanly during shutdown\n";
     }
     runtime.writer.stop();
     runtime.active_session.store(0);

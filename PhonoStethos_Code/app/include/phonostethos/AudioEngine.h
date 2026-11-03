@@ -13,15 +13,17 @@
 #include <thread>
 #include <utility>
 
+using namespace std;
+
 namespace phono_app {
 class AudioEngine {
 public:
-    AudioEngine(const Options& options, std::atomic<unsigned>& mode,
-                std::atomic<unsigned>& gain, std::atomic<bool>& recording,
-                std::atomic<unsigned>& error_code, Telemetry& telemetry,
-                std::mutex& configuration_mutex,
-                std::mutex& telemetry_mutex,
-                std::atomic<std::uint32_t>& dropped_telemetry,
+    AudioEngine(const Options& options, atomic<unsigned>& mode,
+                atomic<unsigned>& gain, atomic<bool>& recording,
+                atomic<unsigned>& error_code, Telemetry& telemetry,
+                mutex& configuration_mutex,
+                mutex& telemetry_mutex,
+                atomic<uint32_t>& dropped_telemetry,
                 FileIOManager& writer);
 
     ~AudioEngine();
@@ -30,7 +32,7 @@ public:
 
     void stop();
 
-    bool start_playback(const std::filesystem::path& path, int descriptor);
+    bool start_playback(const filesystem::path& path, int descriptor);
 
     void stop_playback();
 
@@ -45,30 +47,30 @@ private:
 
     void run();
 
-    void play_file(const std::filesystem::path& path, int descriptor,
-                   std::shared_ptr<std::promise<bool>> ready);
+    void play_file(const filesystem::path& path, int descriptor,
+                   shared_ptr<promise<bool>> ready);
 
     const Options& options_;
-    std::atomic<unsigned>& mode_;
-    std::atomic<unsigned>& gain_;
-    std::atomic<bool>& recording_;
-    std::atomic<unsigned>& error_code_;
+    atomic<unsigned>& mode_;
+    atomic<unsigned>& gain_;
+    atomic<bool>& recording_;
+    atomic<unsigned>& error_code_;
     Telemetry& telemetry_;
-    std::mutex& configuration_mutex_;
-    std::mutex& telemetry_mutex_;
-    std::atomic<std::uint32_t>& dropped_telemetry_;
+    mutex& configuration_mutex_;
+    mutex& telemetry_mutex_;
+    atomic<uint32_t>& dropped_telemetry_;
     FileIOManager& writer_;
     DspProcessor dsp_;
-    std::atomic<bool> ready_{false};
-    std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> playback_requested_{false};
-    std::atomic<bool> playback_cancelled_{false};
-    std::atomic<snd_pcm_t*> capture_pcm_{nullptr};
-    std::mutex capture_mutex_;
+    atomic<bool> ready_{false};
+    atomic<bool> stop_requested_{false};
+    atomic<bool> playback_requested_{false};
+    atomic<bool> playback_cancelled_{false};
+    atomic<snd_pcm_t*> capture_pcm_{nullptr};
+    mutex capture_mutex_;
     DataQueue playback_data_;
-    std::atomic<bool> playback_eof_{false};
-    std::mutex playback_mutex_;
-    std::thread worker_;
-    std::thread playback_thread_;
+    atomic<bool> playback_eof_{false};
+    mutex playback_mutex_;
+    thread worker_;
+    thread playback_thread_;
 };
 }  // namespace phono_app

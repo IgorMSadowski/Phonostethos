@@ -6,8 +6,10 @@
 #include <iostream>
 #include <unistd.h>
 
+using namespace std;
+
 namespace phono_app {
-LedDriver::LedDriver(const std::string& path) : path_(path) {}
+LedDriver::LedDriver(const string& path) : path_(path) {}
 
 LedDriver::~LedDriver() { close(); }
 
@@ -17,17 +19,17 @@ bool LedDriver::open() {
         available_ = true;
         return true;
     }
-    std::cerr << "LED driver " << path_ << ": " << std::strerror(errno)
+    cerr << "LED driver " << path_ << ": " << strerror(errno)
               << '\n';
     return false;
 }
 
-bool LedDriver::write(std::uint8_t command) {
+bool LedDriver::write(uint8_t command) {
     if (fd_ < 0) return false;
     const auto count = ::write(fd_, &command, sizeof(command));
     if (count != static_cast<ssize_t>(sizeof(command))) {
-        std::cerr << "write " << path_ << ": "
-                  << (count < 0 ? std::strerror(errno) : "short write")
+        cerr << "write " << path_ << ": "
+                  << (count < 0 ? strerror(errno) : "short write")
                   << '\n';
         return false;
     }
@@ -35,7 +37,7 @@ bool LedDriver::write(std::uint8_t command) {
 }
 
 bool LedDriver::set_mode(FilterMode mode, bool recording) {
-    std::uint8_t mask = recording ? 0x08 : 0;
+    uint8_t mask = recording ? 0x08 : 0;
     switch (mode) {
         case FilterMode::General: mask |= 0x04; break;
         case FilterMode::Heart: mask |= 0x01; break;

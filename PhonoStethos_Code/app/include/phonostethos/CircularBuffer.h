@@ -3,8 +3,10 @@
 #include <array>
 #include <cstddef>
 
+using namespace std;
+
 namespace phono_app {
-template <typename T, std::size_t Capacity>
+template <typename T, size_t Capacity>
 class CircularBuffer {
     static_assert(Capacity > 0, "CircularBuffer capacity must be positive");
 
@@ -21,21 +23,21 @@ public:
         if (size_ < Capacity) ++size_;
     }
 
-    std::size_t size() const { return size_; }
+    size_t size() const { return size_; }
 
-    void copy_ordered(std::array<T, Capacity>& output) const {
+    void copy_ordered(array<T, Capacity>& output) const {
         const auto first = size_ == Capacity ? next_ : 0;
-        for (std::size_t i = 0; i < size_; ++i) {
+        for (size_t i = 0; i < size_; ++i) {
             output[i] = data_[(first + i) % Capacity];
         }
-        for (std::size_t i = size_; i < Capacity; ++i) {
+        for (size_t i = size_; i < Capacity; ++i) {
             output[i] = T{};
         }
     }
 
 private:
-    std::array<T, Capacity> data_{};
-    std::size_t next_ = 0;
-    std::size_t size_ = 0;
+    array<T, Capacity> data_{};
+    size_t next_ = 0;
+    size_t size_ = 0;
 };
 }  // namespace phono_app

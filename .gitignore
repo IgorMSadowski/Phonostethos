@@ -6,6 +6,7 @@
 !/app
 !/PhonoStethos_Code
 !/phonostethos_cheatsheet.md
+!/PhonoStethos_Complete_Guide.md
 !/DeviceDrivers/
 
 # Keep only the restored ALSA test visible under DeviceDrivers.

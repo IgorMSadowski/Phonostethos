@@ -5,15 +5,17 @@
 #include <array>
 #include <cassert>
 
+using namespace std;
+
 int main() {
     phono_app::CircularBuffer<int, 3> buffer;
     buffer.push(1);
     buffer.push(2);
     buffer.push(3);
     buffer.push(4);
-    std::array<int, 3> ordered{};
+    array<int, 3> ordered{};
     buffer.copy_ordered(ordered);
-    assert((ordered == std::array<int, 3>{2, 3, 4}));
+    assert((ordered == array<int, 3>{2, 3, 4}));
 
     phono_app::CommandQueue commands;
     const phono::protocol::CommandPacket command{

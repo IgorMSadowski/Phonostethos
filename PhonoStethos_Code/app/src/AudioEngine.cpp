@@ -16,13 +16,15 @@
 #include <system_error>
 #include <unistd.h>
 
+using namespace std;
+
 namespace phono_app {
-AudioEngine::AudioEngine(const Options& options, std::atomic<unsigned>& mode,
-            std::atomic<unsigned>& gain, std::atomic<bool>& recording,
-            std::atomic<unsigned>& error_code, Telemetry& telemetry,
-            std::mutex& configuration_mutex,
-            std::mutex& telemetry_mutex,
-            std::atomic<std::uint32_t>& dropped_telemetry,
+AudioEngine::AudioEngine(const Options& options, atomic<unsigned>& mode,
+            atomic<unsigned>& gain, atomic<bool>& recording,
+            atomic<unsigned>& error_code, Telemetry& telemetry,
+            mutex& configuration_mutex,
+            mutex& telemetry_mutex,
+            atomic<uint32_t>& dropped_telemetry,
             FileIOManager& writer)
     : options_(options),
       mode_(mode),
@@ -44,7 +46,7 @@ void AudioEngine::stop() {
     stop_playback();
     stop_requested_.store(true);
     {
-        std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+        lock_guard<mutex> capture_lock(capture_mutex_);
         if (auto* capture = capture_pcm_.load(); capture != nullptr) {
             (void)snd_pcm_drop(capture);
         }
@@ -52,9 +54,9 @@ void AudioEngine::stop() {
     if (worker_.joinable()) worker_.join();
 }
 
-bool AudioEngine::start_playback(const std::filesystem::path& path,
+bool AudioEngine::start_playback(const filesystem::path& path,
                                  int descriptor) {
-    std::lock_guard<std::mutex> lock(playback_mutex_);
+    lock_guard<mutex> lock(playback_mutex_);
     if (playback_thread_.joinable()) {
         playback_cancelled_.store(true);
         playback_requested_.store(false);
@@ -64,16 +66,16 @@ bool AudioEngine::start_playback(const std::filesystem::path& path,
     playback_data_.clear();
     playback_eof_.store(false);
     playback_cancelled_.store(false);
-    auto ready = std::make_shared<std::promise<bool>>();
+    auto ready = make_shared<promise<bool>>();
     auto result = ready->get_future();
     playback_requested_.store(false);
     try {
         playback_thread_ =
-            std::thread(&AudioEngine::play_file, this, path, descriptor,
-                        std::move(ready));
-    } catch (const std::system_error& error) {
+            thread(&AudioEngine::play_file, this, path, descriptor,
+                        move(ready));
+    } catch (const system_error& error) {
         ::close(descriptor);
-        std::cerr << "Cannot start playback file worker: " << error.what()
+        cerr << "Cannot start playback file worker: " << error.what()
                   << '\n';
         return false;
     }
@@ -88,7 +90,7 @@ void AudioEngine::stop_playback() {
     playback_cancelled_.store(true);
     playback_requested_.store(false);
     playback_data_.notify_all();
-    std::lock_guard<std::mutex> lock(playback_mutex_);
+    lock_guard<mutex> lock(playback_mutex_);
     if (playback_thread_.joinable()) playback_thread_.join();
     playback_data_.clear();
     playback_eof_.store(false);
@@ -147,12 +149,12 @@ bool AudioEngine::recover_pcm(snd_pcm_t* pcm, snd_pcm_sframes_t error) {
     if (error == -EPIPE || error == -ESTRPIPE) {
         const int result = snd_pcm_recover(pcm, static_cast<int>(error), 1);
         if (result < 0) {
-            std::cerr << "ALSA recovery: " << snd_strerror(result) << '\n';
+            cerr << "ALSA recovery: " << snd_strerror(result) << '\n';
             return false;
         }
         return true;
     }
-    std::cerr << "ALSA PCM: " << snd_strerror(static_cast<int>(error)) << '\n';
+    cerr << "ALSA PCM: " << snd_strerror(static_cast<int>(error)) << '\n';
     return false;
 }
 
@@ -163,16 +165,16 @@ void AudioEngine::set_audio_thread_policy() {
     const int affinity_result =
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
     if (affinity_result != 0) {
-        std::cerr << "Audio thread CPU affinity not set: "
-                  << std::strerror(affinity_result) << '\n';
+        cerr << "Audio thread CPU affinity not set: "
+                  << strerror(affinity_result) << '\n';
     }
     sched_param priority{};
     priority.sched_priority = 80;
     const int scheduling_result =
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &priority);
     if (scheduling_result != 0) {
-        std::cerr << "Audio thread SCHED_FIFO unavailable: "
-                  << std::strerror(scheduling_result) << '\n';
+        cerr << "Audio thread SCHED_FIFO unavailable: "
+                  << strerror(scheduling_result) << '\n';
     }
 }
 
@@ -182,13 +184,13 @@ void AudioEngine::run() {
     int err = snd_pcm_open(&capture, options_.capture_pcm.c_str(),
                            SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
-        std::cerr << "Cannot open capture PCM '" << options_.capture_pcm
+        cerr << "Cannot open capture PCM '" << options_.capture_pcm
                   << "': " << snd_strerror(err) << '\n';
         error_code_.store(3);
         return;
     }
     if ((err = configure_pcm(capture)) < 0) {
-        std::cerr << "Cannot configure capture PCM: " << snd_strerror(err)
+        cerr << "Cannot configure capture PCM: " << snd_strerror(err)
                   << '\n';
         snd_pcm_close(capture);
         error_code_.store(3);
@@ -199,7 +201,7 @@ void AudioEngine::run() {
     err = snd_pcm_open(&playback, options_.playback_pcm.c_str(),
                        SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
-        std::cerr << "Cannot open playback PCM '" << options_.playback_pcm
+        cerr << "Cannot open playback PCM '" << options_.playback_pcm
                   << "': " << snd_strerror(err) << '\n';
         snd_pcm_close(capture);
         capture_pcm_.store(nullptr);
@@ -207,7 +209,7 @@ void AudioEngine::run() {
         return;
     }
     if ((err = configure_pcm(playback)) < 0) {
-        std::cerr << "Cannot configure playback PCM: " << snd_strerror(err)
+        cerr << "Cannot configure playback PCM: " << snd_strerror(err)
                   << '\n';
         snd_pcm_close(playback);
         snd_pcm_close(capture);
@@ -216,10 +218,10 @@ void AudioEngine::run() {
         return;
     }
 
-    std::array<std::int16_t, kPeriodFrames> input{};
-    std::array<std::int16_t, kPeriodFrames> output{};
+    array<int16_t, kPeriodFrames> input{};
+    array<int16_t, kPeriodFrames> output{};
     if (!dsp_.initialize()) {
-        std::cerr << "Could not create FFTW plan\n";
+        cerr << "Could not create FFTW plan\n";
         ready_.store(false);
         capture_pcm_.store(nullptr);
         snd_pcm_close(playback);
@@ -240,11 +242,11 @@ void AudioEngine::run() {
             if (playback_block) {
                 const int capture_result = snd_pcm_drop(capture);
                 if (capture_result < 0) {
-                    std::cerr << "Could not pause capture for playback: "
+                    cerr << "Could not pause capture for playback: "
                               << snd_strerror(capture_result) << '\n';
                 }
             } else {
-                std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+                lock_guard<mutex> capture_lock(capture_mutex_);
                 capture_pcm_.store(nullptr);
                 snd_pcm_close(capture);
                 capture = nullptr;
@@ -255,7 +257,7 @@ void AudioEngine::run() {
                     capture_result = configure_pcm(capture);
                 }
                 if (capture_result < 0) {
-                    std::cerr << "Cannot reopen capture PCM after playback: "
+                    cerr << "Cannot reopen capture PCM after playback: "
                               << snd_strerror(capture_result) << '\n';
                     if (capture != nullptr) {
                         snd_pcm_close(capture);
@@ -271,7 +273,7 @@ void AudioEngine::run() {
             if (playback_block || playback_cancelled_.load()) {
                 const int output_result = snd_pcm_drop(playback);
                 if (output_result < 0) {
-                    std::cerr << "Cannot discard queued playback audio: "
+                    cerr << "Cannot discard queued playback audio: "
                               << snd_strerror(output_result) << '\n';
                     error_code_.store(static_cast<unsigned>(
                         phono::protocol::Error::OutputError));
@@ -281,7 +283,7 @@ void AudioEngine::run() {
             }
             const int prepare_result = snd_pcm_prepare(playback);
             if (prepare_result < 0) {
-                std::cerr << "Cannot prepare playback after mode change: "
+                cerr << "Cannot prepare playback after mode change: "
                           << snd_strerror(prepare_result) << '\n';
                 error_code_.store(static_cast<unsigned>(
                     phono::protocol::Error::OutputError));
@@ -293,7 +295,7 @@ void AudioEngine::run() {
         if (playback_block) {
             PlaybackBlock block;
             const bool has_block = playback_data_.wait_pop_for(
-                block, std::chrono::milliseconds(10), &playback_cancelled_);
+                block, chrono::milliseconds(10), &playback_cancelled_);
             if (playback_cancelled_.load()) {
                 playback_requested_.store(false);
                 continue;
@@ -301,7 +303,7 @@ void AudioEngine::run() {
             if (!has_block && playback_eof_.load()) {
                 const int drain_result = snd_pcm_drain(playback);
                 if (drain_result < 0) {
-                    std::cerr << "Cannot drain end of playback: "
+                    cerr << "Cannot drain end of playback: "
                               << snd_strerror(drain_result) << '\n';
                     error_code_.store(static_cast<unsigned>(
                         phono::protocol::Error::OutputError));
@@ -318,7 +320,7 @@ void AudioEngine::run() {
             } else {
                 input = block.samples;
                 count = static_cast<snd_pcm_sframes_t>(block.count);
-                std::copy_n(input.begin(), block.count, output.begin());
+                copy_n(input.begin(), block.count, output.begin());
             }
         } else {
             while (count < static_cast<snd_pcm_sframes_t>(input.size()) &&
@@ -343,16 +345,16 @@ void AudioEngine::run() {
             unsigned mode;
             unsigned gain;
             {
-                std::lock_guard<std::mutex> lock(configuration_mutex_);
+                lock_guard<mutex> lock(configuration_mutex_);
                 mode = mode_.load();
                 gain = gain_.load();
             }
             dsp_.process_live(input.data(), output.data(),
-                             static_cast<std::size_t>(count), mode, gain);
+                             static_cast<size_t>(count), mode, gain);
         }
 
         const auto telemetry_frame =
-            dsp_.analyze(output.data(), static_cast<std::size_t>(count));
+            dsp_.analyze(output.data(), static_cast<size_t>(count));
 
         snd_pcm_sframes_t written = 0;
         while (written < count && !stop_requested_.load()) {
@@ -374,8 +376,8 @@ void AudioEngine::run() {
         }
 
         if (telemetry_frame.has_value()) {
-            std::unique_lock<std::mutex> lock(telemetry_mutex_,
-                                              std::try_to_lock);
+            unique_lock<mutex> lock(telemetry_mutex_,
+                                              try_to_lock);
             if (lock.owns_lock()) {
                 telemetry_ = *telemetry_frame;
             } else {
@@ -387,7 +389,7 @@ void AudioEngine::run() {
     ready_.store(false);
     playback_requested_.store(false);
     {
-        std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+        lock_guard<mutex> capture_lock(capture_mutex_);
         capture_pcm_.store(nullptr);
         if (capture != nullptr) {
             snd_pcm_close(capture);
@@ -398,12 +400,12 @@ void AudioEngine::run() {
     snd_pcm_close(playback);
 }
 
-void AudioEngine::play_file(const std::filesystem::path& path, int descriptor,
-                            std::shared_ptr<std::promise<bool>> ready) {
+void AudioEngine::play_file(const filesystem::path& path, int descriptor,
+                            shared_ptr<promise<bool>> ready) {
     SF_INFO info{};
     SNDFILE* file = sf_open_fd(descriptor, SFM_READ, &info, SF_FALSE);
     if (file == nullptr) {
-        std::cerr << "Cannot open playback file " << path << ": "
+        cerr << "Cannot open playback file " << path << ": "
                   << sf_strerror(nullptr) << '\n';
         ::close(descriptor);
         error_code_.store(
@@ -415,7 +417,7 @@ void AudioEngine::play_file(const std::filesystem::path& path, int descriptor,
     if (info.channels != 1 || info.samplerate != kSampleRate ||
         (info.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
         (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
-        std::cerr << "Unsupported playback format in " << path << '\n';
+        cerr << "Unsupported playback format in " << path << '\n';
         (void)sf_close(file);
         ::close(descriptor);
         error_code_.store(static_cast<unsigned>(
@@ -425,7 +427,7 @@ void AudioEngine::play_file(const std::filesystem::path& path, int descriptor,
         return;
     }
     bool readiness_sent = false;
-    std::array<std::int16_t, kPeriodFrames> samples{};
+    array<int16_t, kPeriodFrames> samples{};
     while (!playback_cancelled_.load() && running.load()) {
         const auto count = sf_read_short(file, samples.data(), samples.size());
         if (count < 0) {
@@ -449,9 +451,9 @@ void AudioEngine::play_file(const std::filesystem::path& path, int descriptor,
         }
 
         PlaybackBlock block;
-        block.count = static_cast<std::size_t>(count);
-        std::copy_n(samples.begin(), block.count, block.samples.begin());
-        if (!playback_data_.push(std::move(block), &playback_cancelled_)) {
+        block.count = static_cast<size_t>(count);
+        copy_n(samples.begin(), block.count, block.samples.begin());
+        if (!playback_data_.push(move(block), &playback_cancelled_)) {
             break;
         }
         if (!readiness_sent) {

@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+using namespace std;
+
 namespace phono_app {
 class BiquadFilter {
 public:
@@ -35,8 +37,8 @@ private:
         constexpr double kButterworthQ = 0.7071067811865475244;
         const double omega = 2.0 * 3.14159265358979323846 * cutoff /
                              sample_rate;
-        const double cosine = std::cos(omega);
-        const double alpha = std::sin(omega) / (2.0 * kButterworthQ);
+        const double cosine = cos(omega);
+        const double alpha = sin(omega) / (2.0 * kButterworthQ);
         const double a0 = 1.0 + alpha;
         if (high_pass) {
             b0_ = (1.0 + cosine) / (2.0 * a0);

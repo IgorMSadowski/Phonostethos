@@ -7,20 +7,22 @@
 #include <limits>
 #include <vector>
 
+using namespace std;
+
 int main() {
     using namespace phono::protocol;
 
-    const std::uint8_t length_bytes[] = {0, 0, 0x18, 0};
+    const uint8_t length_bytes[] = {0, 0, 0x18, 0};
     if (read_u32_be(length_bytes) != 6144) return 1;
 
-    std::vector<std::uint8_t> integer;
+    vector<uint8_t> integer;
     append_u32_be(integer, 0x12345678);
-    if (integer != std::vector<std::uint8_t>{0x12, 0x34, 0x56, 0x78}) {
+    if (integer != vector<uint8_t>{0x12, 0x34, 0x56, 0x78}) {
         return 2;
     }
 
     CommandPacket command{};
-    const std::array<std::uint8_t, 5> gain_command{2, 0, 0, 0, 2};
+    const array<uint8_t, 5> gain_command{2, 0, 0, 0, 2};
     if (!decode_command(gain_command.data(), gain_command.size(), command) ||
         command.type != Command::SetGain || command.value != 2) {
         return 3;
@@ -30,7 +32,7 @@ int main() {
     }
 
     const auto status = make_status_packet(Status{1, 1, 0, 0});
-    if (status != std::vector<std::uint8_t>{kStatus, 1, 1, 0, 0}) return 5;
+    if (status != vector<uint8_t>{kStatus, 1, 1, 0, 0}) return 5;
 
     const auto files = make_file_list_packet(
         0, {{12, "HEART_20261101_143022_000001.wav"}});
@@ -50,8 +52,8 @@ int main() {
         return 8;
     }
 
-    std::array<float, kWaveformSamples> waveform{};
-    std::array<float, kSpectrumSamples> spectrum{};
+    array<float, kWaveformSamples> waveform{};
+    array<float, kSpectrumSamples> spectrum{};
     waveform[0] = 1.0F;
     waveform[1] = -1.0F;
     spectrum[0] = 0.5F;
@@ -79,9 +81,9 @@ int main() {
     }
     FrameDecoder state_decoder;
     Frame state_frame;
-    for (std::size_t offset = 0; offset < state_packet.size();) {
-        const std::size_t count = offset == 0 ? 2 : 3;
-        const auto copied = std::min(count, state_packet.size() - offset);
+    for (size_t offset = 0; offset < state_packet.size();) {
+        const size_t count = offset == 0 ? 2 : 3;
+        const auto copied = min(count, state_packet.size() - offset);
         if (!state_decoder.append(state_packet.data() + offset, copied)) return 11;
         offset += copied;
     }
@@ -112,15 +114,15 @@ int main() {
         return 15;
     }
 
-    const auto invalid_float = std::numeric_limits<float>::infinity();
+    const auto invalid_float = numeric_limits<float>::infinity();
     waveform[0] = invalid_float;
     try {
         (void)make_data_packet(waveform, spectrum);
         return 16;
-    } catch (const std::invalid_argument&) {
+    } catch (const invalid_argument&) {
     }
 
-    const std::vector<std::uint8_t> malformed{kState, 0, 0, 0, 19};
+    const vector<uint8_t> malformed{kState, 0, 0, 0, 19};
     FrameDecoder malformed_decoder;
     Frame malformed_frame;
     if (!malformed_decoder.append(malformed.data(), malformed.size()) ||

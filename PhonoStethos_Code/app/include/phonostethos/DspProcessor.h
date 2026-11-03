@@ -12,6 +12,8 @@
 #include <optional>
 #include <utility>
 
+using namespace std;
+
 namespace phono_app {
 class DspProcessor {
 public:
@@ -23,21 +25,21 @@ public:
 
     bool initialize();
     void reset();
-    void process_live(const std::int16_t* input, std::int16_t* output,
-                      std::size_t count, unsigned mode, unsigned gain);
-    std::optional<Telemetry> analyze(const std::int16_t* samples,
-                                     std::size_t count);
+    void process_live(const int16_t* input, int16_t* output,
+                      size_t count, unsigned mode, unsigned gain);
+    optional<Telemetry> analyze(const int16_t* samples,
+                                     size_t count);
 
 private:
-    static std::pair<double, double> filter_limits(unsigned mode);
+    static pair<double, double> filter_limits(unsigned mode);
 
     CircularBuffer<float, kFftFrames> history_;
-    std::array<float, kFftFrames> fft_input_{};
-    std::array<float, kFftFrames> waveform_{};
-    std::array<fftwf_complex, kFftFrames / 2 + 1> fft_output_{};
+    array<float, kFftFrames> fft_input_{};
+    array<float, kFftFrames> waveform_{};
+    array<fftwf_complex, kFftFrames / 2 + 1> fft_output_{};
     fftwf_plan fft_plan_ = nullptr;
     BandPassFilter filter_;
     unsigned configured_mode_ = 99;
-    std::size_t frames_since_fft_ = 0;
+    size_t frames_since_fft_ = 0;
 };
 }  // namespace phono_app

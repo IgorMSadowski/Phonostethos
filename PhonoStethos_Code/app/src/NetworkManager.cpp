@@ -26,29 +26,31 @@
 #include <unistd.h>
 #include <vector>
 
+using namespace std;
+
 namespace phono_app {
 namespace {
 using namespace phono_app;
-bool send_all(int fd, const std::vector<std::uint8_t>& data) {
-    std::size_t sent = 0;
+bool send_all(int fd, const vector<uint8_t>& data) {
+    size_t sent = 0;
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        chrono::steady_clock::now() + chrono::milliseconds(100);
     while (sent < data.size()) {
         const auto count =
             ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
         if (count < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                const auto now = std::chrono::steady_clock::now();
+                const auto now = chrono::steady_clock::now();
                 if (now >= deadline) return false;
                 const auto remaining =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                    chrono::duration_cast<chrono::milliseconds>(
                         deadline - now)
                         .count();
                 pollfd writable{fd, POLLOUT, 0};
                 const int ready = ::poll(
                     &writable, 1,
-                    static_cast<int>(std::min<std::int64_t>(remaining, 10)));
+                    static_cast<int>(min<int64_t>(remaining, 10)));
                 if (ready < 0 && errno != EINTR) return false;
                 if (ready > 0 &&
                     (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
@@ -59,32 +61,32 @@ bool send_all(int fd, const std::vector<std::uint8_t>& data) {
             return false;
         }
         if (count == 0) return false;
-        sent += static_cast<std::size_t>(count);
+        sent += static_cast<size_t>(count);
     }
     return true;
 }
 
 bool storage_has_space(const Options& options) {
-    std::error_code error;
-    const auto space = std::filesystem::space(options.storage, error);
+    error_code error;
+    const auto space = filesystem::space(options.storage, error);
     return !error && space.available >= 1024 * 1024;
 }
 
-std::vector<std::string> list_recordings(const Options& options) {
-    std::vector<std::string> files;
+vector<string> list_recordings(const Options& options) {
+    vector<string> files;
     if (!storage_ready(options)) return files;
-    std::error_code error;
-    for (std::filesystem::directory_iterator it(options.storage, error), end;
+    error_code error;
+    for (filesystem::directory_iterator it(options.storage, error), end;
          !error && it != end; it.increment(error)) {
         if (it->is_regular_file(error) && it->path().extension() == ".wav") {
             files.push_back(it->path().filename().string());
         }
     }
-    std::sort(files.begin(), files.end());
+    sort(files.begin(), files.end());
     return files;
 }
 
-std::vector<std::uint8_t> status_packet(SystemController& runtime) {
+vector<uint8_t> status_packet(SystemController& runtime) {
     const bool mounted = storage_ready(runtime.options);
     const bool space_ok = mounted && storage_has_space(runtime.options);
     const bool readable =
@@ -99,15 +101,15 @@ std::vector<std::uint8_t> status_packet(SystemController& runtime) {
                                            : 0U);
     const bool healthy = runtime.error_code.load() == 0;
     const phono::protocol::Status status{
-        static_cast<std::uint8_t>(mounted),
-        static_cast<std::uint8_t>(mounted && writable && space_ok && healthy),
-        static_cast<std::uint8_t>(mounted && readable && space_ok && healthy),
-        static_cast<std::uint8_t>(reported_error)};
+        static_cast<uint8_t>(mounted),
+        static_cast<uint8_t>(mounted && writable && space_ok && healthy),
+        static_cast<uint8_t>(mounted && readable && space_ok && healthy),
+        static_cast<uint8_t>(reported_error)};
     return phono::protocol::make_status_packet(status);
 }
 
-std::vector<std::uint8_t> state_packet(SystemController& runtime) {
-    std::uint8_t storage_flags = 0;
+vector<uint8_t> state_packet(SystemController& runtime) {
+    uint8_t storage_flags = 0;
     const bool mounted = storage_ready(runtime.options);
     if (mounted) {
         storage_flags |= phono::protocol::StoragePresent;
@@ -125,19 +127,19 @@ std::vector<std::uint8_t> state_packet(SystemController& runtime) {
     unsigned mode_value;
     unsigned gain_value;
     {
-        std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+        lock_guard<mutex> lock(runtime.configuration_mutex);
         mode_value = runtime.mode.load();
         gain_value = runtime.gain.load();
     }
-    const auto mode = static_cast<std::uint8_t>(
-        std::min(mode_value, 2U));
+    const auto mode = static_cast<uint8_t>(
+        min(mode_value, 2U));
     const phono::protocol::State state{
         runtime.transport.load(),
         mode,
-        static_cast<std::uint8_t>(std::clamp(gain_value, 1U, 10U)),
+        static_cast<uint8_t>(clamp(gain_value, 1U, 10U)),
         storage_flags,
-        static_cast<std::uint8_t>(runtime.error_code.load() != 0
-                                      ? std::min(runtime.error_code.load(), 255U)
+        static_cast<uint8_t>(runtime.error_code.load() != 0
+                                      ? min(runtime.error_code.load(), 255U)
                                       : (runtime.led_error.load()
                                              ? static_cast<unsigned>(
                                                    phono::protocol::Error::LedDriverError)
@@ -148,13 +150,13 @@ std::vector<std::uint8_t> state_packet(SystemController& runtime) {
     return phono::protocol::make_state_packet(state);
 }
 
-bool send_archive(int fd, SystemController& runtime, std::uint32_t cursor,
+bool send_archive(int fd, SystemController& runtime, uint32_t cursor,
                   phono::protocol::Error& error_code) {
     error_code = phono::protocol::Error::None;
     const auto names = list_recordings(runtime.options);
-    std::vector<phono::protocol::FileEntry> archive;
+    vector<phono::protocol::FileEntry> archive;
     {
-        std::lock_guard<std::mutex> lock(runtime.archive_mutex);
+        lock_guard<mutex> lock(runtime.archive_mutex);
         for (const auto& name : names) {
             const auto path = runtime.options.storage / name;
             struct stat metadata {};
@@ -172,7 +174,7 @@ bool send_archive(int fd, SystemController& runtime, std::uint32_t cursor,
             }
             if (needs_new_id) {
                 if (runtime.next_file_id == 0) {
-                    std::cerr << "Connection file ID space exhausted\n";
+                    cerr << "Connection file ID space exhausted\n";
                     return false;
                 }
                 const auto id = runtime.next_file_id++;
@@ -183,33 +185,33 @@ bool send_archive(int fd, SystemController& runtime, std::uint32_t cursor,
                                          metadata.st_size, metadata.st_mtim});
             }
             if (name.size() <= phono::protocol::kMaxBasenameBytes &&
-                name.find_first_of("\t\r\n/\\") == std::string::npos) {
+                name.find_first_of("\t\r\n/\\") == string::npos) {
                 archive.push_back({identity->second, name});
             }
         }
     }
 
-    std::size_t start = 0;
+    size_t start = 0;
     if (cursor != 0) {
-        const auto found = std::find_if(
+        const auto found = find_if(
             archive.begin(), archive.end(),
             [cursor](const auto& entry) { return entry.id == cursor; });
         if (found == archive.end()) {
             error_code = phono::protocol::Error::StaleFileId;
             return true;
         }
-        start = static_cast<std::size_t>(found - archive.begin()) + 1;
+        start = static_cast<size_t>(found - archive.begin()) + 1;
     }
 
-    std::vector<phono::protocol::FileEntry> page;
-    std::size_t payload_bytes =
-        std::string("next_cursor=4294967295\n").size();
-    for (std::size_t index = start;
+    vector<phono::protocol::FileEntry> page;
+    size_t payload_bytes =
+        string("next_cursor=4294967295\n").size();
+    for (size_t index = start;
          index < archive.size() && page.size() < phono::protocol::kMaxFileListEntries;
          ++index) {
         const auto& entry = archive[index];
         const auto entry_bytes =
-            std::to_string(entry.id).size() + 1 + entry.basename.size() + 1;
+            to_string(entry.id).size() + 1 + entry.basename.size() + 1;
         if (payload_bytes + entry_bytes >
             phono::protocol::kMaxFileListPayloadBytes) {
             break;
@@ -223,26 +225,26 @@ bool send_archive(int fd, SystemController& runtime, std::uint32_t cursor,
         const auto packet =
             phono::protocol::make_file_list_packet(next_cursor, page);
         return send_all(fd, packet);
-    } catch (const std::exception& error) {
-        std::cerr << "Cannot serialize archive page: " << error.what() << '\n';
+    } catch (const exception& error) {
+        cerr << "Cannot serialize archive page: " << error.what() << '\n';
         return false;
     }
 }
 
-std::pair<std::filesystem::path, int> reserve_recording_path(SystemController& runtime) {
-    const auto now = std::chrono::system_clock::to_time_t(
-        std::chrono::system_clock::now());
-    std::tm local{};
+pair<filesystem::path, int> reserve_recording_path(SystemController& runtime) {
+    const auto now = chrono::system_clock::to_time_t(
+        chrono::system_clock::now());
+    tm local{};
     localtime_r(&now, &local);
     char timestamp[32]{};
-    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local);
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local);
     const char* modes[] = {"GENERAL", "HEART", "LUNG"};
-    const auto mode = std::min(runtime.mode.load(), 2U);
-    for (std::uint32_t attempts = 0; attempts < 1000000; ++attempts) {
+    const auto mode = min(runtime.mode.load(), 2U);
+    for (uint32_t attempts = 0; attempts < 1000000; ++attempts) {
         const auto session_id = runtime.next_session_id++;
         char session[16]{};
-        std::snprintf(session, sizeof(session), "%06u", session_id);
-        const auto basename = std::string(modes[mode]) + "_" + timestamp +
+        snprintf(session, sizeof(session), "%06u", session_id);
+        const auto basename = string(modes[mode]) + "_" + timestamp +
                               "_" + session + ".wav";
         const auto path = runtime.options.storage / basename;
         const int descriptor =
@@ -252,11 +254,11 @@ std::pair<std::filesystem::path, int> reserve_recording_path(SystemController& r
             return {path, descriptor};
         }
         if (errno != EEXIST) {
-            throw std::system_error(errno, std::generic_category(),
+            throw system_error(errno, generic_category(),
                                     "exclusive recording-file creation");
         }
     }
-    throw std::runtime_error("recording filename counter exhausted");
+    throw runtime_error("recording filename counter exhausted");
 }
 
 phono::protocol::CommandResult handle_command(
@@ -271,11 +273,11 @@ phono::protocol::CommandResult handle_command(
     };
     const auto rejected = [command](Error error) {
         return phono::protocol::CommandResult{
-            command, Result::Rejected, static_cast<std::uint32_t>(error)};
+            command, Result::Rejected, static_cast<uint32_t>(error)};
     };
     const auto failed = [command](Error error) {
         return phono::protocol::CommandResult{
-            command, Result::Failed, static_cast<std::uint32_t>(error)};
+            command, Result::Failed, static_cast<uint32_t>(error)};
     };
     const auto worker_failure = [&runtime](Error fallback) {
         const auto code = runtime.error_code.load();
@@ -291,14 +293,14 @@ phono::protocol::CommandResult handle_command(
     switch (command) {
         case Command::SetMode:
             {
-                std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+                lock_guard<mutex> lock(runtime.configuration_mutex);
                 runtime.mode.store(value);
             }
             runtime.update_leds();
             return completed();
         case Command::SetGain:
             {
-                std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+                lock_guard<mutex> lock(runtime.configuration_mutex);
                 runtime.gain.store(value);
             }
             return completed();
@@ -326,13 +328,13 @@ phono::protocol::CommandResult handle_command(
                         return failed(static_cast<Error>(error));
                     }
                     ::close(descriptor);
-                    std::error_code remove_error;
-                    std::filesystem::remove(path, remove_error);
+                    error_code remove_error;
+                    filesystem::remove(path, remove_error);
                     runtime.active_session.store(0);
                     return rejected(Error::Busy);
                 }
-            } catch (const std::system_error& error) {
-                std::cerr << "Cannot create recording path: " << error.what()
+            } catch (const system_error& error) {
+                cerr << "Cannot create recording path: " << error.what()
                           << '\n';
                 const auto failure = error.code().value() == ENOSPC
                                          ? Error::DiskFull
@@ -340,8 +342,8 @@ phono::protocol::CommandResult handle_command(
                 runtime.error_code.store(static_cast<unsigned>(failure));
                 runtime.active_session.store(0);
                 return failed(failure);
-            } catch (const std::runtime_error& error) {
-                std::cerr << "Cannot create recording path: " << error.what()
+            } catch (const runtime_error& error) {
+                cerr << "Cannot create recording path: " << error.what()
                           << '\n';
                 runtime.error_code.store(
                     static_cast<unsigned>(Error::OpenError));
@@ -371,14 +373,14 @@ phono::protocol::CommandResult handle_command(
         case Command::PlayAudio: {
             ArchiveIdentity identity;
             {
-                std::lock_guard<std::mutex> lock(runtime.archive_mutex);
+                lock_guard<mutex> lock(runtime.archive_mutex);
                 const auto found = runtime.archive_by_id.find(value);
                 if (found == runtime.archive_by_id.end()) {
                     return rejected(Error::StaleFileId);
                 }
                 identity = found->second;
             }
-            const std::filesystem::path safe_name(identity.basename);
+            const filesystem::path safe_name(identity.basename);
             struct stat metadata {};
             if (safe_name.filename() != safe_name ||
                 safe_name.extension() != ".wav") {
@@ -447,24 +449,24 @@ phono::protocol::CommandResult handle_command(
             if (storage_fd < 0 || ::syncfs(storage_fd) != 0) {
                 const int sync_error = errno;
                 if (storage_fd >= 0) ::close(storage_fd);
-                std::cerr << "Cannot synchronize storage: "
-                          << std::strerror(sync_error) << '\n';
+                cerr << "Cannot synchronize storage: "
+                          << strerror(sync_error) << '\n';
                 runtime.error_code.store(
                     static_cast<unsigned>(Error::UnmountError));
                 runtime.transport.store(phono::protocol::Transport::Live);
                 return failed(Error::UnmountError);
             }
             if (::close(storage_fd) != 0) {
-                std::cerr << "Cannot close synchronized storage handle: "
-                          << std::strerror(errno) << '\n';
+                cerr << "Cannot close synchronized storage handle: "
+                          << strerror(errno) << '\n';
                 runtime.error_code.store(
                     static_cast<unsigned>(Error::UnmountError));
                 runtime.transport.store(phono::protocol::Transport::Live);
                 return failed(Error::UnmountError);
             }
             if (::umount2(runtime.options.storage.c_str(), 0) != 0) {
-                std::cerr << "Cannot eject storage " << runtime.options.storage
-                          << ": " << std::strerror(errno) << '\n';
+                cerr << "Cannot eject storage " << runtime.options.storage
+                          << ": " << strerror(errno) << '\n';
                 runtime.error_code.store(
                     static_cast<unsigned>(Error::UnmountError));
                 runtime.transport.store(phono::protocol::Transport::Live);
@@ -478,14 +480,14 @@ phono::protocol::CommandResult handle_command(
         case Command::DeleteRecording: {
             ArchiveIdentity identity;
             {
-                std::lock_guard<std::mutex> lock(runtime.archive_mutex);
+                lock_guard<mutex> lock(runtime.archive_mutex);
                 const auto found = runtime.archive_by_id.find(value);
                 if (found == runtime.archive_by_id.end()) {
                     return rejected(Error::StaleFileId);
                 }
                 identity = found->second;
             }
-            const std::filesystem::path safe_name(identity.basename);
+            const filesystem::path safe_name(identity.basename);
             struct stat metadata {};
             if (safe_name.filename() != safe_name ||
                 safe_name.extension() != ".wav") {
@@ -504,8 +506,8 @@ phono::protocol::CommandResult handle_command(
                 runtime.error_code.load() != 0) {
                 return rejected(Error::StorageLost);
             }
-            std::error_code error;
-            if (!std::filesystem::remove(runtime.options.storage / safe_name,
+            error_code error;
+            if (!filesystem::remove(runtime.options.storage / safe_name,
                                          error) ||
                 error) {
                 runtime.error_code.store(
@@ -531,13 +533,13 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
                      sizeof(io_timeout)) != 0 ||
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout,
                      sizeof(io_timeout)) != 0) {
-        std::cerr << "Cannot configure client socket timeouts: "
-                  << std::strerror(errno) << '\n';
+        cerr << "Cannot configure client socket timeouts: "
+                  << strerror(errno) << '\n';
         ::close(fd);
         return;
     }
     {
-        std::lock_guard<std::mutex> lock(runtime.archive_mutex);
+        lock_guard<mutex> lock(runtime.archive_mutex);
         runtime.archive_by_id.clear();
         runtime.archive_id_by_name.clear();
         runtime.next_file_id = 1;
@@ -547,8 +549,8 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
         ::close(fd);
         return;
     }
-    std::vector<std::uint8_t> receive_buffer;
-    auto next_update = std::chrono::steady_clock::now();
+    vector<uint8_t> receive_buffer;
+    auto next_update = chrono::steady_clock::now();
     unsigned last_mode = runtime.mode.load();
     bool last_recording = runtime.recording.load();
     unsigned last_error = runtime.error_code.load();
@@ -558,7 +560,7 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
         if (ready < 0 && errno != EINTR) break;
         if (ready > 0 && (event.revents & (POLLERR | POLLHUP | POLLNVAL))) break;
         if (ready > 0 && (event.revents & POLLIN)) {
-            std::array<std::uint8_t, 128> incoming{};
+            array<uint8_t, 128> incoming{};
             const auto count = ::recv(fd, incoming.data(), incoming.size(), 0);
             if (count <= 0) {
                 if (count < 0 &&
@@ -570,14 +572,14 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
             receive_buffer.insert(receive_buffer.end(), incoming.begin(),
                                   incoming.begin() + count);
             while (receive_buffer.size() >= 5) {
-                std::array<std::uint8_t, 5> command{};
-                std::copy_n(receive_buffer.begin(), command.size(), command.begin());
+                array<uint8_t, 5> command{};
+                copy_n(receive_buffer.begin(), command.size(), command.begin());
                 receive_buffer.erase(receive_buffer.begin(),
                                      receive_buffer.begin() + command.size());
                 phono::protocol::CommandPacket decoded;
                 if (!phono::protocol::decode_command(
                         command.data(), command.size(), decoded)) {
-                    std::cerr << "Closing client after invalid command frame\n";
+                    cerr << "Closing client after invalid command frame\n";
                     ::close(fd);
                     return;
                 }
@@ -603,7 +605,7 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
                     if (archive_error != phono::protocol::Error::None) {
                         result.result = phono::protocol::Result::Rejected;
                         result.detail =
-                            static_cast<std::uint32_t>(archive_error);
+                            static_cast<uint32_t>(archive_error);
                     }
                 }
                 const auto response =
@@ -629,10 +631,10 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
         }
         last_error = error;
 
-        if (std::chrono::steady_clock::now() >= next_update) {
+        if (chrono::steady_clock::now() >= next_update) {
             Telemetry telemetry;
             {
-                std::lock_guard<std::mutex> lock(runtime.telemetry_mutex);
+                lock_guard<mutex> lock(runtime.telemetry_mutex);
                 telemetry = runtime.telemetry;
             }
             if (!send_all(fd, status_packet(runtime)) ||
@@ -641,8 +643,8 @@ void NetworkManager::serve_client(int fd, SystemController& runtime) {
                                   telemetry.waveform, telemetry.spectrum))) {
                 break;
             }
-            next_update = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(64);
+            next_update = chrono::steady_clock::now() +
+                          chrono::milliseconds(64);
         }
     }
     ::close(fd);
@@ -652,7 +654,7 @@ int NetworkManager::run(SystemController& controller) {
     const auto& options = controller.options;
     const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        std::cerr << "socket: " << std::strerror(errno) << '\n';
+        cerr << "socket: " << strerror(errno) << '\n';
         return 1;
     }
     int reuse = 1;
@@ -663,25 +665,25 @@ int NetworkManager::run(SystemController& controller) {
     address.sin_port = htons(options.port);
     if (::inet_pton(AF_INET, options.bind_address.c_str(), &address.sin_addr) !=
         1) {
-        std::cerr << "Invalid IPv4 bind address: " << options.bind_address
+        cerr << "Invalid IPv4 bind address: " << options.bind_address
                   << '\n';
         ::close(server_fd);
         return 2;
     }
     if (::bind(server_fd, reinterpret_cast<sockaddr*>(&address),
                sizeof(address)) < 0) {
-        std::cerr << "bind " << options.bind_address << ':' << options.port
-                  << ": " << std::strerror(errno) << '\n';
+        cerr << "bind " << options.bind_address << ':' << options.port
+                  << ": " << strerror(errno) << '\n';
         ::close(server_fd);
         return 1;
     }
     if (::listen(server_fd, 1) < 0) {
-        std::cerr << "listen: " << std::strerror(errno) << '\n';
+        cerr << "listen: " << strerror(errno) << '\n';
         ::close(server_fd);
         return 1;
     }
 
-    std::cout << "PhonoStethos Raspberry Pi service listening on "
+    cout << "PhonoStethos Raspberry Pi service listening on "
               << options.bind_address << ':' << options.port << '\n';
     int result = 0;
     while (running.load()) {
@@ -690,7 +692,7 @@ int NetworkManager::run(SystemController& controller) {
         const auto ready = ::poll(&listener, 1, 250);
         if (ready < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "poll: " << std::strerror(errno) << '\n';
+            cerr << "poll: " << strerror(errno) << '\n';
             result = 1;
             break;
         }
@@ -701,7 +703,7 @@ int NetworkManager::run(SystemController& controller) {
             ::accept(server_fd, reinterpret_cast<sockaddr*>(&peer), &peer_size);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "accept: " << std::strerror(errno) << '\n';
+            cerr << "accept: " << strerror(errno) << '\n';
             result = 1;
             break;
         }
