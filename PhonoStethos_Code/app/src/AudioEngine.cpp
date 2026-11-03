@@ -43,8 +43,11 @@ bool AudioEngine::ready() const { return ready_.load(); }
 void AudioEngine::stop() {
     stop_playback();
     stop_requested_.store(true);
-    if (auto* capture = capture_pcm_.load(); capture != nullptr) {
-        (void)snd_pcm_drop(capture);
+    {
+        std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+        if (auto* capture = capture_pcm_.load(); capture != nullptr) {
+            (void)snd_pcm_drop(capture);
+        }
     }
     if (worker_.joinable()) worker_.join();
 }
@@ -116,7 +119,27 @@ int AudioEngine::configure_pcm(snd_pcm_t* pcm) {
              pcm, params, &period, nullptr)) < 0) {
         return err;
     }
+    snd_pcm_uframes_t buffer = period * 4;
+    if ((err = snd_pcm_hw_params_set_buffer_size_near(
+             pcm, params, &buffer)) < 0) {
+        return err;
+    }
     if ((err = snd_pcm_hw_params(pcm, params)) < 0) return err;
+
+    snd_pcm_sw_params_t* software;
+    snd_pcm_sw_params_alloca(&software);
+    if ((err = snd_pcm_sw_params_current(pcm, software)) < 0 ||
+        (err = snd_pcm_sw_params_set_avail_min(pcm, software, period)) < 0 ||
+        (err = snd_pcm_sw_params_set_stop_threshold(
+             pcm, software, buffer)) < 0) {
+        return err;
+    }
+    if (snd_pcm_stream(pcm) == SND_PCM_STREAM_PLAYBACK &&
+        (err = snd_pcm_sw_params_set_start_threshold(
+             pcm, software, period)) < 0) {
+        return err;
+    }
+    if ((err = snd_pcm_sw_params(pcm, software)) < 0) return err;
     return snd_pcm_prepare(pcm);
 }
 
@@ -214,6 +237,57 @@ void AudioEngine::run() {
         const bool playback_block = playback_requested_.load();
         if (playback_block != previous_playback) {
             dsp_.reset();
+            if (playback_block) {
+                const int capture_result = snd_pcm_drop(capture);
+                if (capture_result < 0) {
+                    std::cerr << "Could not pause capture for playback: "
+                              << snd_strerror(capture_result) << '\n';
+                }
+            } else {
+                std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+                capture_pcm_.store(nullptr);
+                snd_pcm_close(capture);
+                capture = nullptr;
+                int capture_result = snd_pcm_open(
+                    &capture, options_.capture_pcm.c_str(),
+                    SND_PCM_STREAM_CAPTURE, 0);
+                if (capture_result >= 0) {
+                    capture_result = configure_pcm(capture);
+                }
+                if (capture_result < 0) {
+                    std::cerr << "Cannot reopen capture PCM after playback: "
+                              << snd_strerror(capture_result) << '\n';
+                    if (capture != nullptr) {
+                        snd_pcm_close(capture);
+                        capture = nullptr;
+                    }
+                    error_code_.store(static_cast<unsigned>(
+                        phono::protocol::Error::MicLost));
+                    stop_requested_.store(true);
+                    break;
+                }
+                capture_pcm_.store(capture);
+            }
+            if (playback_block || playback_cancelled_.load()) {
+                const int output_result = snd_pcm_drop(playback);
+                if (output_result < 0) {
+                    std::cerr << "Cannot discard queued playback audio: "
+                              << snd_strerror(output_result) << '\n';
+                    error_code_.store(static_cast<unsigned>(
+                        phono::protocol::Error::OutputError));
+                    stop_requested_.store(true);
+                    break;
+                }
+            }
+            const int prepare_result = snd_pcm_prepare(playback);
+            if (prepare_result < 0) {
+                std::cerr << "Cannot prepare playback after mode change: "
+                          << snd_strerror(prepare_result) << '\n';
+                error_code_.store(static_cast<unsigned>(
+                    phono::protocol::Error::OutputError));
+                stop_requested_.store(true);
+                break;
+            }
             previous_playback = playback_block;
         }
         if (playback_block) {
@@ -225,6 +299,13 @@ void AudioEngine::run() {
                 continue;
             }
             if (!has_block && playback_eof_.load()) {
+                const int drain_result = snd_pcm_drain(playback);
+                if (drain_result < 0) {
+                    std::cerr << "Cannot drain end of playback: "
+                              << snd_strerror(drain_result) << '\n';
+                    error_code_.store(static_cast<unsigned>(
+                        phono::protocol::Error::OutputError));
+                }
                 playback_requested_.store(false);
                 continue;
             }
@@ -305,10 +386,16 @@ void AudioEngine::run() {
 
     ready_.store(false);
     playback_requested_.store(false);
-    capture_pcm_.store(nullptr);
+    {
+        std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+        capture_pcm_.store(nullptr);
+        if (capture != nullptr) {
+            snd_pcm_close(capture);
+            capture = nullptr;
+        }
+    }
     (void)snd_pcm_drain(playback);
     snd_pcm_close(playback);
-    snd_pcm_close(capture);
 }
 
 void AudioEngine::play_file(const std::filesystem::path& path, int descriptor,

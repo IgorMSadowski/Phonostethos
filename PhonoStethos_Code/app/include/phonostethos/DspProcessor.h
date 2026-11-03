@@ -1,5 +1,6 @@
 #pragma once
 
+#include "phonostethos/BandPassFilter.h"
 #include "phonostethos/CircularBuffer.h"
 #include "phonostethos/RuntimeTypes.h"
 
@@ -35,10 +36,7 @@ private:
     std::array<float, kFftFrames> waveform_{};
     std::array<fftwf_complex, kFftFrames / 2 + 1> fft_output_{};
     fftwf_plan fft_plan_ = nullptr;
-    double previous_x1_ = 0.0;
-    double previous_x2_ = 0.0;
-    double previous_y1_ = 0.0;
-    double previous_y2_ = 0.0;
+    BandPassFilter filter_;
     unsigned configured_mode_ = 99;
     std::size_t frames_since_fft_ = 0;
 };

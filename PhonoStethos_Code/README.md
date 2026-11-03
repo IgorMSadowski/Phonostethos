@@ -47,6 +47,23 @@ The root `Makefile` also compiles and stages the device-tree overlay, udev
 permissions, and init script. The LED mask is HEART `0x01` / BCM17, LUNG
 `0x02` / BCM27, GENERAL `0x04` / BCM24, and recording `0x08` / BCM22.
 
+The server stores recordings on the drive mounted at `/media/usb_storage`.
+The Buildroot overlay installs an eudev rule to mount USB exFAT or FAT32
+partitions there when connected and unmount them when removed. The root
+`make install` stages the rule, mount helper, and kernel exFAT module; rebuild
+and deploy the image for automatic mounting to take effect. Do not remove the
+drive during recording or playback; if it is busy on removal, stop using it and
+unmount it manually.
+
+To check the mount status on the Pi:
+
+```sh
+cat /proc/mounts | grep /media/usb_storage
+```
+
+The connected GUI updates its storage status automatically, and the server can
+remain running while the drive is mounted or unmounted.
+
 ## Flutter host
 
 ```sh

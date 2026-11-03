@@ -21,10 +21,7 @@ bool DspProcessor::initialize() {
 
 void DspProcessor::reset() {
     history_.clear();
-    previous_x1_ = 0.0;
-    previous_x2_ = 0.0;
-    previous_y1_ = 0.0;
-    previous_y2_ = 0.0;
+    filter_.reset();
     configured_mode_ = 99;
     frames_since_fft_ = 0;
 }
@@ -33,32 +30,13 @@ void DspProcessor::process_live(const std::int16_t* input,
                                 std::int16_t* output, std::size_t count,
                                 unsigned mode, unsigned gain) {
     if (mode != configured_mode_) {
-        previous_x1_ = 0.0;
-        previous_x2_ = 0.0;
-        previous_y1_ = 0.0;
-        previous_y2_ = 0.0;
+        const auto [low, high] = filter_limits(mode);
+        filter_.configure(low, high, kSampleRate);
         configured_mode_ = mode;
     }
-    const auto [low, high] = filter_limits(mode);
-    const double center = std::sqrt(low * high);
-    const double q = center / (high - low);
-    const double omega = 2.0 * 3.14159265358979323846 * center / kSampleRate;
-    const double alpha = std::sin(omega) / (2.0 * q);
-    const double a0 = 1.0 + alpha;
-    const double b0 = alpha / a0;
-    const double b2 = -alpha / a0;
-    const double a1 = -2.0 * std::cos(omega) / a0;
-    const double a2 = (1.0 - alpha) / a0;
 
     for (std::size_t i = 0; i < count; ++i) {
-        const double x = input[i];
-        const double filtered =
-            b0 * x + b2 * previous_x2_ - a1 * previous_y1_ -
-            a2 * previous_y2_;
-        previous_x2_ = previous_x1_;
-        previous_x1_ = x;
-        previous_y2_ = previous_y1_;
-        previous_y1_ = filtered;
+        const double filtered = filter_.process(input[i]);
         output[i] = static_cast<std::int16_t>(
             std::clamp(filtered * gain, -32768.0, 32767.0));
     }

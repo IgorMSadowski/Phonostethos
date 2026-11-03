@@ -1,0 +1,77 @@
+#!/bin/sh
+
+STORAGE=/media/usb_storage
+EXFAT_MODULE=/lib/modules/$(uname -r)/kernel/fs/exfat/exfat.ko
+UTF8_MODULE=/lib/modules/$(uname -r)/kernel/fs/nls/nls_utf8.ko
+LOCK=/run/phonostethos-usb-mount.lock
+
+log() {
+    echo "phonostethos-usb-mount: $*" >&2
+}
+
+case "$ACTION:$DEVTYPE" in
+    add:partition|remove:partition)
+        case "$DEVNAME" in
+            /dev/sd[a-z][0-9]*) ;;
+            *) exit 0 ;;
+        esac
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+attempt=0
+until mkdir "$LOCK" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 20 ]; then
+        log "timed out waiting for the mount lock"
+        exit 1
+    fi
+    sleep 0.1
+done
+trap 'rmdir "$LOCK"' EXIT
+
+if [ "$ACTION" = remove ]; then
+    while read -r source target filesystem options rest; do
+        if [ "$target" = "$STORAGE" ] && [ "$source" = "$DEVNAME" ]; then
+            if ! umount "$STORAGE"; then
+                log "could not unmount $DEVNAME; stop using the drive and unmount it manually"
+                exit 1
+            fi
+            log "unmounted $DEVNAME"
+            break
+        fi
+    done < /proc/mounts
+    exit 0
+fi
+
+if grep -Fq " $STORAGE " /proc/mounts; then
+    exit 0
+fi
+
+if ! mkdir -p "$STORAGE"; then
+    log "could not create $STORAGE"
+    exit 1
+fi
+
+if ! grep -qw exfat /proc/filesystems; then
+    if [ -f "$UTF8_MODULE" ] && ! grep -qw nls_utf8 /proc/modules; then
+        if ! insmod "$UTF8_MODULE"; then
+            log "could not load the UTF-8 charset module"
+        fi
+    fi
+    if [ -f "$EXFAT_MODULE" ] && ! insmod "$EXFAT_MODULE"; then
+        log "could not load the exFAT filesystem module"
+    fi
+fi
+
+for filesystem in exfat vfat; do
+    if mount -o rw,nosuid,nodev,noexec -t "$filesystem" "$DEVNAME" "$STORAGE"; then
+        log "mounted $DEVNAME ($filesystem) at $STORAGE"
+        exit 0
+    fi
+done
+
+log "could not mount $DEVNAME; supported formats are exFAT and FAT32"
+exit 1

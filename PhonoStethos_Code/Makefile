@@ -1,6 +1,6 @@
 BUILDROOT_DIR ?= /home/igor/buildroot/buildroot-2026.08
 BUILD_DIR ?= app/build-pi
-TOOLCHAIN_FILE := app/cmake/buildroot-aarch64.cmake
+TOOLCHAIN_FILE := $(abspath app/cmake/buildroot-aarch64.cmake)
 KERNEL_DIR ?= $(BUILDROOT_DIR)/output/build/linux-custom
 HOST_DIR := $(BUILDROOT_DIR)/output/host
 OVERLAY_DIR ?= $(BUILDROOT_DIR)/output/target
@@ -39,10 +39,18 @@ install: build driver overlay
 		$(OVERLAY_DIR)/usr/bin/phonostethos-server
 	install -D -m 0644 kernel-driver/phonostethos_leds.ko \
 		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/extra/phonostethos_leds.ko
+	install -D -m 0644 $(KERNEL_DIR)/fs/exfat/exfat.ko \
+		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/kernel/fs/exfat/exfat.ko
+	install -D -m 0644 $(KERNEL_DIR)/fs/nls/nls_utf8.ko \
+		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/kernel/fs/nls/nls_utf8.ko
 	install -D -m 0644 $(DTB_OUTPUT) \
 		$(OVERLAY_DIR)/boot/overlays/phonostethos-status-leds.dtbo
-	install -D -m 0644 kernel-driver/phonostethos_leds.rules \
+	install -D -m 0644 kernel-driver/phonostethos-leds.rules \
 		$(OVERLAY_DIR)/etc/udev/rules.d/99-phonostethos-leds.rules
+	install -D -m 0644 kernel-driver/phonostethos-usb.rules \
+		$(OVERLAY_DIR)/etc/udev/rules.d/99-phonostethos-usb.rules
+	install -D -m 0755 kernel-driver/deploy/phonostethos-usb-mount \
+		$(OVERLAY_DIR)/usr/sbin/phonostethos-usb-mount
 	install -D -m 0644 kernel-driver/phonostethos-status-leds-overlay.dts \
 		$(OVERLAY_DIR)/usr/share/phonostethos/phonostethos-status-leds-overlay.dts
 	install -D -m 0755 kernel-driver/deploy/S90phonostethos \

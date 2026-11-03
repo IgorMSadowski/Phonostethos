@@ -326,13 +326,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(height: 12),
               Expanded(
                 child: _chartPanel(
-                  'Frequency spectrum',
-                  'Hz · dBFS · 7.8125 Hz per bin',
+                  'Frequency spectrum · ${_modeName(_mode)}',
+                  '${_bandDescription(_mode)} highlighted · 7.8 Hz/bin · dBFS',
                   _spectrum,
                   Colors.orangeAccent,
-                  minY: -120,
+                  minY: -90,
                   maxY: 0,
                   maxX: 4000,
+                  highlightedRange: _modeBand(_mode),
+                  frequencyAxis: true,
                 ),
               ),
             ],
@@ -455,6 +457,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ),
       );
 
+  String _modeName(int mode) =>
+      const ['General', 'Heart', 'Lung'][mode.clamp(0, 2)];
+
+  RangeValues _modeBand(int mode) => switch (mode) {
+        1 => const RangeValues(20, 600),
+        2 => const RangeValues(100, 1000),
+        _ => const RangeValues(20, 2000),
+      };
+
+  String _bandDescription(int mode) {
+    final band = _modeBand(mode);
+    return '${band.start.round()}–${band.end.round()} Hz passband';
+  }
+
   Widget _buildArchiveTab() => Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -554,6 +570,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     required double minY,
     required double maxY,
     required double maxX,
+    RangeValues? highlightedRange,
+    bool frequencyAxis = false,
   }) =>
       Card(
         child: Padding(
@@ -581,8 +599,59 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       rightTitles: AxisTitles(
                         sideTitles: SideTitles(showTitles: false),
                       ),
+                    ).copyWith(
+                      bottomTitles: AxisTitles(
+                        axisNameWidget:
+                            frequencyAxis ? const Text('Frequency (Hz)') : null,
+                        sideTitles: SideTitles(
+                          showTitles: frequencyAxis,
+                          interval: 1000,
+                          reservedSize: 28,
+                          getTitlesWidget: (value, meta) => SideTitleWidget(
+                            meta: meta,
+                            child: Text(
+                              value.round().toString(),
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 9,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      leftTitles: AxisTitles(
+                        axisNameWidget:
+                            frequencyAxis ? const Text('dBFS') : null,
+                        sideTitles: SideTitles(
+                          showTitles: frequencyAxis,
+                          interval: 30,
+                          reservedSize: 36,
+                          getTitlesWidget: (value, meta) => SideTitleWidget(
+                            meta: meta,
+                            child: Text(
+                              value.round().toString(),
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 9,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                     lineTouchData: const LineTouchData(enabled: false),
+                    rangeAnnotations: RangeAnnotations(
+                      verticalRangeAnnotations: highlightedRange == null
+                          ? const []
+                          : [
+                              VerticalRangeAnnotation(
+                                x1: highlightedRange.start,
+                                x2: highlightedRange.end,
+                                color:
+                                    Colors.tealAccent.withValues(alpha: 0.10),
+                              ),
+                            ],
+                    ),
                     lineBarsData: [
                       LineChartBarData(
                         spots: spots,

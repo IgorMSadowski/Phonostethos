@@ -64,6 +64,7 @@ private:
     std::atomic<bool> playback_requested_{false};
     std::atomic<bool> playback_cancelled_{false};
     std::atomic<snd_pcm_t*> capture_pcm_{nullptr};
+    std::mutex capture_mutex_;
     DataQueue playback_data_;
     std::atomic<bool> playback_eof_{false};
     std::mutex playback_mutex_;

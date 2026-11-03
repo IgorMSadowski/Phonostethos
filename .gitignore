@@ -6,6 +6,16 @@
 !/app
 !/PhonoStethos_Code
 !/phonostethos_cheatsheet.md
+!/DeviceDrivers/
+
+# Keep only the restored ALSA test visible under DeviceDrivers.
+/DeviceDrivers/*
+!/DeviceDrivers/DD_AlsaTest/
+/DeviceDrivers/DD_AlsaTest/*
+!/DeviceDrivers/DD_AlsaTest/AlsaTest
+!/DeviceDrivers/DD_AlsaTest/AlsaTest.c
+!/DeviceDrivers/DD_AlsaTest/AlsaTest.o
+!/DeviceDrivers/DD_AlsaTest/Makefile
 
 # Inside app/, still ignore build artifacts and generated files
 /app/build/

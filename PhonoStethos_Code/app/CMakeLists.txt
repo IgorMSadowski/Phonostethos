@@ -9,6 +9,11 @@ option(PHONO_BUILD_SERVER "Build the Raspberry Pi hardware server" ON)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(band-pass-filter-test tests/band_pass_filter_test.cpp)
+    target_include_directories(band-pass-filter-test PRIVATE include)
+    target_compile_options(band-pass-filter-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME band-pass-filter-test COMMAND band-pass-filter-test)
+
     add_executable(protocol-test tests/protocol_test.cpp)
     target_include_directories(protocol-test PRIVATE include)
     target_compile_options(protocol-test PRIVATE -Wall -Wextra -Wpedantic)

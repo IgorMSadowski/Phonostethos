@@ -1,0 +1,1 @@
+savedcmd_/home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/Module.symvers -T /home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/modules.order -i Module.symvers -e 
