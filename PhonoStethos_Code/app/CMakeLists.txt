@@ -31,6 +31,7 @@ if(PHONO_BUILD_SERVER)
     pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
     pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
     pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
+    pkg_check_modules(UDEV REQUIRED IMPORTED_TARGET libudev)
 
     add_executable(phonostethos-server
         src/AudioEngine.cpp
@@ -47,6 +48,7 @@ if(PHONO_BUILD_SERVER)
         PkgConfig::ALSA
         PkgConfig::FFTW3F
         PkgConfig::SNDFILE
+        PkgConfig::UDEV
     )
     target_compile_definitions(phonostethos-server PRIVATE _GNU_SOURCE)
     target_compile_options(phonostethos-server PRIVATE -Wall -Wextra -Wpedantic)

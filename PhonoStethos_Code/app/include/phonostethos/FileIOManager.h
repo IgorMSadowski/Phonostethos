@@ -1,58 +1,78 @@
 #pragma once
 
+#include "phonostethos/CircularBuffer.h"
+#include "phonostethos/CommandQueue.h"
 #include "phonostethos/RuntimeTypes.h"
 
 #include <condition_variable>
 #include <deque>
-#include <future>
-#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <sndfile.h>
 
 using namespace std;
 
 namespace phono_app {
-struct FileWork {
-    enum class Kind { Start, Samples, Stop, Barrier };
-    Kind kind = Kind::Samples;
-    filesystem::path path;
-    array<int16_t, kPeriodFrames> samples{};
-    int descriptor = -1;
-    shared_ptr<promise<void>> barrier;
-    shared_ptr<promise<bool>> completion;
-};
-
 class FileIOManager {
 public:
-    FileIOManager(atomic<unsigned>& error_code,
-                    atomic<bool>& recording,
-                    atomic<uint32_t>& recording_overruns,
-                    const Options& options);
+    enum class RequestKind {
+        OpenRecording,
+        CloseRecording,
+        PreparePlayback,
+        StopPlayback,
+        List,
+        Delete,
+        Eject,
+        Mount,
+        DeviceRemoved,
+        RefreshStorage,
+    };
 
+    struct Request {
+        RequestKind kind = RequestKind::List;
+        uint32_t operation_id = 0;
+        filesystem::path path;
+        string filesystem_type;
+        ArchiveIdentity identity;
+    };
+
+    FileIOManager(const Options& options, CommandQueue& messages,
+                  CircularBuffer<int16_t, kCircularBufferSamples>& recording,
+                  CircularBuffer<int16_t, kCircularBufferSamples>& playback);
     ~FileIOManager();
 
-    bool start(const filesystem::path& path, int descriptor);
-
-    bool push(const array<int16_t, kPeriodFrames>& samples);
-
-    bool finish();
-
-    bool finish_and_wait();
-
+    bool request(Request request);
     void stop();
 
 private:
     void run();
+    void set_file_thread_policy();
+    void process_request(const Request& request, SNDFILE*& recording_file,
+                         int& recording_fd, SNDFILE*& playback_file,
+                         int& playback_fd, bool& recording_active,
+                         bool& playback_active,
+                         uint32_t& recording_operation,
+                         uint32_t& playback_operation);
+    bool write_recording(SNDFILE* file);
+    void read_playback(SNDFILE* file, bool& playback_active,
+                       uint32_t operation_id);
+    bool storage_available() const;
+    void post_result(WorkerResultCode code, uint32_t operation_id,
+                     uint8_t error = 0);
+    void post_storage_status(WorkerResultCode code, uint32_t operation_id);
 
-    atomic<unsigned>& error_code_;
-    atomic<bool>& recording_state_;
-    atomic<uint32_t>& recording_overruns_;
     const Options& options_;
-    mutable mutex mutex_;
-    condition_variable ready_;
-    deque<FileWork> queue_;
-    bool recording_ = false;
+    CommandQueue& messages_;
+    CircularBuffer<int16_t, kCircularBufferSamples>& recording_;
+    CircularBuffer<int16_t, kCircularBufferSamples>& playback_;
+    mutex mailbox_mutex_;
+    condition_variable mailbox_ready_;
+    optional<Request> mailbox_;
     bool stopping_ = false;
+    atomic<uint8_t> recording_error_{0};
+    string mounted_device_;
+    bool storage_removed_ = false;
     thread worker_;
 };
 }  // namespace phono_app

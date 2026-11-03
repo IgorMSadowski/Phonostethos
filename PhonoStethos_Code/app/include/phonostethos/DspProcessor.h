@@ -1,7 +1,6 @@
 #pragma once
 
 #include "phonostethos/BandPassFilter.h"
-#include "phonostethos/CircularBuffer.h"
 #include "phonostethos/RuntimeTypes.h"
 
 #include <fftw3.h>
@@ -33,7 +32,9 @@ public:
 private:
     static pair<double, double> filter_limits(unsigned mode);
 
-    CircularBuffer<float, kFftFrames> history_;
+    array<float, kFftFrames> history_{};
+    size_t history_next_ = 0;
+    size_t history_size_ = 0;
     array<float, kFftFrames> fft_input_{};
     array<float, kFftFrames> waveform_{};
     array<fftwf_complex, kFftFrames / 2 + 1> fft_output_{};

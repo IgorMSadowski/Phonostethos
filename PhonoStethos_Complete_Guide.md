@@ -98,7 +98,7 @@ application namespace.
 - A **mutex** is a lock that prevents simultaneous access to a protected region.
   A **condition variable** lets a thread sleep until a condition may have
   changed.
-- A **template** such as `SynchronizedQueue<T, Capacity>` is a type/function
+- A **template** such as `CircularBuffer<T, Capacity>` is a type/function
   recipe that is specialized for a particular data type and capacity.
 - `optional<T>` means a result may contain a `T` or may be empty.
 - `promise<T>` and its matching future let one thread provide a result that
@@ -146,8 +146,8 @@ This header contains application-wide audio, storage, and state definitions.
 - `kFftBins`: `512` spectrum values transmitted to the client. FFTW's real
   transform has 513 output bins; the implementation sends indices 0 through
   511 and omits the Nyquist bin.
-- `kMaxPendingAudioBlocks`: `7`, used as a queue-size limit for file work.
-- `kPlaybackCapacityBlocks`: `8`, the capacity of the playback sample queue.
+- `kCircularBufferSamples`: `4096`, the fixed sample capacity of each shared
+  recording/playback FIFO.
 - `kPi`: the numeric value of pi.
 - `kLedDevice`: default device path `/dev/phonostethos_leds`.
 - `running`: an `atomic<bool>` global set false during signal-driven shutdown.
@@ -167,18 +167,14 @@ and easier to understand than scattered magic numbers.
 - `require_mounted_storage`: if true, storage must actually be mounted for
   storage operations.
 
-`storage_ready(options)` checks that the configured storage path is a directory.
-If mounted storage is required, it scans `/proc/self/mounts` and requires an
-entry whose mount point equals that path.
+`storage_ready(options)` checks that the configured path is a directory. When
+`require_mounted_storage` is true, it canonicalizes that path and checks
+`/proc/self/mountinfo` for an exact mounted path.
 
 `Telemetry` has two fixed-size arrays:
 
 - `waveform`: 1024 floats of processed, normalized audio history.
 - `spectrum`: 512 floats of non-negative FFT magnitudes.
-
-`PlaybackBlock` contains an array of 512 signed PCM16 samples and `count`, the
-number of valid samples in that block. The final block of a WAV can be shorter
-than 512.
 
 `ArchiveIdentity` is the server's record of a file offered to a client:
 
@@ -291,45 +287,60 @@ Protocol helper functions:
 - `make_data_packet` verifies all waveform/spectrum values are finite and
   magnitudes are non-negative, serializes floats, then builds a data frame.
 
-### `SynchronizedQueue.h`, `CommandQueue.h`, and `DataQueue.h`
+### `CommandQueue.h` and `DataQueue.h`
 
-`SynchronizedQueue<T, Capacity>` is a bounded FIFO queue shared safely between
-threads. Its private fields are `mutex_` (protects the deque and closed flag),
-`data_available_` (wakes consumers), `space_available_` (wakes producers),
-`queue_` (the stored values), and `closed_` (prevents new pushes).
+`MainMessage` is the common message exchanged between Main, Network, AudioDSP,
+and FileIO. `kind` distinguishes decoded GUI commands, normal worker results,
+and worker errors. `command` contains a decoded five-byte command; the
+`operation_id` correlates asynchronous results; `result_code`, `error_code`,
+and `storage_flags` carry completion/status information; `archive` carries
+FileIO's archive snapshot.
 
-- `push(value, cancelled)` waits until there is capacity, the queue closes, or
-  the optional atomic cancellation flag becomes true. It moves the value into
-  the queue and wakes one consumer. It returns false on close/cancel.
-- `try_pop(value)` returns immediately; when nonempty it moves out the oldest
-  value and wakes a producer.
-- `wait_pop_for(value, wait, cancelled)` waits up to the supplied duration for
-  data/close/cancel and then removes one item if present.
-- `clear()` removes queued items and wakes producers.
-- `notify_all()` wakes both producer and consumer waiters.
-- `close()` sets `closed_` under the lock and wakes everyone.
+`WorkerResultCode` names events such as `AudioReady`, `RecordingOpened`,
+`PlaybackFinished`, `ArchiveReady`, and `StorageChanged`. These are internal
+thread messages, not new wire-protocol command IDs.
 
-`CommandQueue` specializes this template for `CommandPacket` with capacity 32.
-`DataQueue` specializes it for `PlaybackBlock` with capacity eight. In the
-current code, `CommandQueue` is used as a short-lived push/pop in the network
-handler; it is not the report's worker-result mailbox. `DataQueue` is the
-playback-audio queue, not a visualization queue.
+`CommandQueue` is an unbounded FIFO of `MainMessage` values. A mutex protects
+its deque, and a condition variable wakes Main when a producer enqueues a
+message. `dequeue()` waits for at most 10 ms so Main can also check udev.
+`close()` rejects future messages and wakes waiters. Network puts decoded
+commands on it; AudioDSP and FileIO put their results/errors on the same queue.
+
+`DataQueue` is deliberately separate: it holds zero or one `Telemetry`
+snapshot. AudioDSP uses a try-lock enqueue, replacing an older waiting snapshot
+so slow network transmission cannot make the real-time audio loop wait.
+Network dequeues the newest snapshot only when no control frame is waiting.
+Disconnect clears the snapshot and disables enqueueing until another client
+connects.
+
+`ControlOutputQueue` is in `NetworkManager.h`; it is a separate FIFO for status,
+state, command-result, and archive frames. Network always services these
+control frames before optional telemetry. `AudioEngine` and `FileIOManager`
+also each have a separate one-request mailbox; these are command handoff
+mechanisms, not additional sample queues.
 
 ### `CircularBuffer.h`
 
-`CircularBuffer<T, Capacity>` is a fixed-size ring that overwrites its oldest
-sample after becoming full. `data_` stores values; `next_` is the next position
-to write; `size_` tracks the number of initialized elements.
+`CircularBuffer<T, Capacity>` is a synchronized bounded FIFO; it does **not**
+overwrite accepted samples. The controller owns two distinct instances, each
+with 4096 PCM16 slots: the recording FIFO (AudioDSP producer, FileIO consumer)
+and playback FIFO (FileIO producer, AudioDSP consumer). `mutex_` protects the
+array, indices, count, and producer/stop gates; `data_available_` lets a
+consumer wait for samples or stop.
 
-- `clear()` fills the array with default values and resets indices.
-- `push(value)` writes at `next_`, advances modulo capacity, and grows `size_`
-  up to the capacity.
-- `size()` returns the number of stored values.
-- `copy_ordered(output)` copies oldest-to-newest into the start of the supplied
-  array, then fills unused positions with default values.
+- `begin_session()` opens the producer gate only when the old session is empty.
+- `push(data, count)` inserts a whole block or rejects it when stopped/full;
+  rejection is visible to the caller, allowing recording overrun reporting.
+- `pop(destination, maximum, timeout)` waits up to the timeout and returns the
+  number of actual samples removed, including a final partial block.
+- `stop_producing()` closes the producer gate and wakes a waiting consumer;
+  queued samples can still be drained.
+- `clear()` discards remaining samples and leaves the FIFO stopped.
+- `size()`, `isEmpty()`, `isFull()`, `available_capacity()`, and `stopped()`
+  expose synchronized state.
 
-The production use is FFT/waveform history in `DspProcessor`; this buffer does
-not synchronize threads and is not the report's shared recording queue.
+The FFT history is a separate private array inside `DspProcessor`; it does not
+use this cross-thread FIFO.
 
 ## 5. C++ headers: class interfaces and stored state
 
@@ -377,72 +388,46 @@ is a managed resource.
 
 ### `AudioEngine.h`
 
-`AudioEngine` coordinates ALSA capture/output, DSP, recording, and playback.
-Its constructor takes references to shared configuration/status values so it
-does not create independent copies:
+`AudioEngine` owns the AudioDSP worker. The constructor receives shared atomics
+for `mode_`, `gain_`, `recording_`, and `error_code_`; references to the common
+`CommandQueue` and telemetry `DataQueue`; the configuration mutex; references
+to the separate recording and playback `CircularBuffer`s; and counters for
+dropped telemetry and recording overruns.
 
-- `options_`: ALSA names and other settings.
-- `mode_`, `gain_`, `recording_`, `error_code_`: atomic shared values.
-- `telemetry_`: the current waveform/spectrum snapshot.
-- `configuration_mutex_`, `telemetry_mutex_`: protect multi-step access to the
-  respective shared values.
-- `dropped_telemetry_`: count of snapshots skipped when the telemetry mutex is
-  busy.
-- `writer_`: file-work producer interface.
-- `dsp_`: processor instance.
-- `ready_`: audio devices and DSP initialized successfully.
-- `stop_requested_`: shuts down the capture worker.
-- `playback_requested_`, `playback_cancelled_`: playback state/cancellation.
-- `capture_pcm_`: atomic pointer used so shutdown can interrupt capture.
-- `capture_mutex_`: coordinates capture-handle closure with stop.
-- `playback_data_`: bounded queue of audio blocks read from a WAV.
-- `playback_eof_`: file reader reached end-of-file.
-- `playback_mutex_`: protects playback thread start/join.
-- `worker_`: main audio loop thread.
-- `playback_thread_`: reads a WAV and feeds `playback_data_`.
+Its single-slot `request_` mailbox carries `SuspendCapture`, `ResumeCapture`,
+`StartPlayback`, or `StopPlayback` plus an operation ID. `request_mutex_`
+protects the optional request, and the worker checks it on its loop. `ready_`
+and `stop_requested_` are atomics. `capture_pcm_` lets `stop()` interrupt a
+blocking ALSA capture, while `capture_mutex_` protects its close path. `dsp_`
+and `worker_` are private worker-owned state.
 
-Public functions: constructor starts the audio worker; destructor calls `stop`;
-`ready()` reports startup success; `stop()` cancels playback and stops/joins
-audio; `start_playback(path, descriptor)` launches a WAV reader and waits for
-initial validation/readiness; `stop_playback()` cancels and joins that reader;
-`playing()` checks `playback_requested_`.
-
-Private functions: `configure_pcm(pcm)` sets ALSA PCM format/rate/channels/period
-and thresholds; `recover_pcm(pcm, error)` attempts recovery from ALSA underrun
-or suspend; `set_audio_thread_policy()` requests CPU 1 and SCHED_FIFO priority
-80 (the calls can fail, e.g. due to permissions); `run()` owns ALSA capture and
-output processing; `play_file(path, descriptor, ready)` validates and reads
-mono 8 kHz PCM16 WAV data into the playback queue.
+The public constructor starts the worker; destructor calls `stop()`;
+`request()` offers one command if the mailbox is empty; `ready()` reports
+successful ALSA/DSP startup; and `stop()` interrupts and joins the worker.
+Private `configure_pcm`, `recover_pcm`, and `set_audio_thread_policy` configure
+the ALSA stream, recover underruns/suspends, and request core 1/SCHED_FIFO 80.
+`apply_request` performs the mailbox command on the audio thread; `run()` owns
+both ALSA handles, routes live/playback samples, records to the shared FIFO,
+and offers telemetry without waiting for the network.
 
 ### `FileIOManager.h`
 
-`FileWork` is a message handled by the file worker. Its scoped `Kind` enum is
-`Start`, `Samples`, `Stop`, or `Barrier`. Fields:
+`FileIOManager::RequestKind` includes `OpenRecording`, `CloseRecording`,
+`PreparePlayback`, `StopPlayback`, `List`, `Delete`, `Eject`, `Mount`,
+`DeviceRemoved`, and `RefreshStorage`. A `Request` contains its kind, operation
+ID, path/filesystem type, or the identity of an archive file as appropriate.
+Its optional one-request mailbox is guarded by `mailbox_mutex_`; the worker
+wakes on `mailbox_ready_`. The worker exclusively owns both libsndfile handles
+and their file descriptors, plus the active recording/playback state.
 
-- `kind`: operation kind.
-- `path`: recording file path used for Start.
-- `samples`: one 512-sample block used for Samples.
-- `descriptor`: already-open file descriptor supplied for Start.
-- `barrier`: promise completed when all preceding file work is processed.
-- `completion`: bool promise used by Start/Stop callers.
-
-`FileIOManager` owns a dedicated `worker_` thread and FIFO `queue_`. `mutex_`
-protects the deque and flags; `ready_` wakes the worker; `recording_` is the
-worker's protected recording state; `stopping_` tells it to drain and exit.
-References `error_code_`, `recording_state_`, and `recording_overruns_` publish
-results; `options_` supplies storage configuration.
-
-- Constructor starts `run()` in the worker thread; destructor calls `stop()`.
-- `start(path, descriptor)` enqueues Start and waits for the file to open.
-- `push(samples)` enqueues a block while recording; if the bounded pending-work
-  threshold has been reached it stops production, increments overrun count, and
-  schedules Stop.
-- `finish()` disables recording and queues Stop, waiting for close completion.
-- `finish_and_wait()` calls finish and then enqueues a barrier to ensure previous
-  work has passed the worker.
-- `stop()` requests thread termination and joins it.
-- `run()` consumes Start/Samples/Stop/Barrier work, uses libsndfile for WAV
-  writing, classifies storage errors, and closes resources.
+`request()` rejects an occupied mailbox; `stop()` stops both shared buffers,
+wakes the worker, and joins it. `run()` waits in 10 ms intervals, dispatches
+requests, drains recording samples, refills playback samples, and closes all
+remaining handles at shutdown. `write_recording()` writes up to 512 PCM16
+samples and records storage/write failures; `read_playback()` fills only
+available playback-FIFO capacity. `post_storage_status()` computes presence,
+mount, access, and free-space flags. Mount/eject/list/delete and safe removal
+handling also run on this worker, so Main never performs file or mount I/O.
 
 ### `LedDriver.h`
 
@@ -462,40 +447,40 @@ The driver also reserves `0xff` for the short error flash.
 
 ### `SystemController.h`
 
-`SystemController` is the shared runtime data holder. Its constructor retains a
-reference to `options`, constructs the LED wrapper and file worker, and the
-server later constructs the audio engine.
+`SystemController` is the Main coordinator and owns authoritative transport,
+mode, gain, recording, error, and active-session state. It constructs
+`CommandQueue`, `DataQueue`, `ControlOutputQueue`, `LedDriver`, `FileIOManager`,
+and `NetworkManager`; it creates `AudioEngine` during `initSystem()`. The
+recording/playback FIFOs and configuration mutex are shared with the audio and
+file workers. `archive_by_id_`, `archive_id_by_name_`, and `archive_entries_`
+translate connection-local archive IDs to safe file identities. The `next_*`
+fields generate session, operation, and archive IDs. `pending_` tracks one
+asynchronous operation and collects its worker completions; `storage_flags_`
+and `audio_ready_` drive reported capabilities.
 
-- `mode`: selected mode as an atomic unsigned integer (the enum's numeric value).
-- `gain`: atomic gain multiplier.
-- `recording`: atomic recording flag.
-- `error_code`: atomic protocol error number.
-- `led_error`: atomic indication that the device write failed.
-- `transport`: current protocol transport enum.
-- `active_session`: current recording ID, or zero when none.
-- `dropped_telemetry`: number of skipped GUI snapshots.
-- `recording_overruns`: number of file queue overrun events.
-- `telemetry`: latest waveform and spectrum.
-- `configuration_mutex`: protects mode/gain snapshot.
-- `telemetry_mutex`: protects telemetry snapshot.
-- `archive_mutex`: protects archive ID/name/identity maps.
-- `archive_by_id`: server file ID to identity.
-- `archive_id_by_name`: filename to server file ID.
-- `next_file_id`, `next_session_id`: ID generators.
-- `led_driver`, `writer`, `command_queue`: subsystem objects.
-- `audio`: unique pointer to the AudioEngine.
-
-`update_leds()` converts mode and recording values into an LED mask and stores
-whether the driver write failed. `refresh_runtime_state()` returns transport to
-Live when playback ends, or when recording has ended, and clears the finished
-recording session.
+`initSystem()` initializes udev, LEDs, audio, and networking. `run()` is the
+Main-thread loop: it dequeues messages with a 10 ms timeout, checks USB events,
+submits deferred storage work, and periodically refreshes storage status.
+`process_command()` validates and routes each command; `handle_worker_result()`
+advances the operation state machine; `complete_operation()` publishes the
+final result and updated state. `publish_status()`, `publish_state()`, and
+`publish_command_result()` put frames on Network's control FIFO. `update_leds()`
+is the only place that commits the complete mode/recording mask.
+`init_udev_monitor()`, `check_usb_events()`, and
+`dispatch_deferred_mount()` keep device monitoring and mount requests on Main
+while leaving the actual mount/file work to FileIO. `stop()` joins workers and
+releases resources.
 
 ### `NetworkManager.h`
 
-This header forward-declares `SystemController` to avoid including its full
-definition in every user. `NetworkManager::run(controller)` creates and runs the
-TCP listening server. `NetworkManager::serve_client(socket_fd, controller)`
-handles one connected client synchronously.
+`ControlOutputQueue` is a mutex-protected FIFO of already-encoded control
+frames. `NetworkManager` owns a dedicated worker thread and references the
+`CommandQueue`, telemetry `DataQueue`, and control-output FIFO. `start()` and
+`stop()` start/join the worker; `connected()` reports connection state; and
+`queue_control()` posts a frame for the network thread to send. Private `run()`
+owns the listening socket, while `serve_client()` handles a single connected
+client. `send_all()` enforces the frame-send deadline, and
+`set_network_thread_policy()` requests core 3 with SCHED_OTHER.
 
 ## 6. C++ implementation files and function behavior
 
@@ -540,54 +525,62 @@ These are requests, not guarantees; errors are logged.
 
 `run()`:
 
-1. Opens capture and playback devices named by `Options`.
-2. Configures both and initializes DSP. On failure it logs, stores an error, and
-   returns; `ready_` becomes true only after successful setup.
-3. Repeatedly checks stop/global-running state and whether playback is active.
-4. On capture/playback transitions, resets DSP and drops/prepares ALSA queues;
-   it closes/reopens capture around playback.
-5. In live mode, accumulates capture reads into up to 512 samples, snapshots
-   mode/gain under `configuration_mutex_`, and filters/gains them.
-6. In playback mode, waits briefly for a queued block. It copies valid samples
-   for output; an absent block at EOF drains output, and a temporary missing
-   block is treated as an underflow/error.
-7. Analyzes the output samples for telemetry and writes them to the playback
-   PCM device, recovering from supported ALSA errors.
-8. For live recording only, pushes the processed output block to `writer_`.
-9. Publishes telemetry only if `telemetry_mutex_` can be acquired immediately;
-   otherwise increments `dropped_telemetry_` rather than delaying the audio
-   thread.
-10. On exit, marks not ready, closes capture safely, drains/closes playback.
+1. Opens/configures capture and playback PCM streams and initializes DSP. It
+   reports `AudioReady` through `CommandQueue`; initialization failure is
+   reported with an explicit error.
+2. Requests its core/real-time policy and marks itself ready.
+3. On each pass, takes at most one command from its single-slot mailbox and
+   applies suspend/resume/playback transitions on the audio thread.
+4. In live mode, reads one 512-frame block, snapshots mode/gain under
+   `configuration_mutex_`, and filters/amplifies it. In playback mode, consumes
+   up to 512 samples from the playback `CircularBuffer`; temporary underflow
+   produces silence, while stopped-and-empty means end of playback.
+5. Writes the result to the playback PCM, analyzes it for telemetry, and uses
+   the recording `CircularBuffer` when recording is active. A full recording
+   FIFO stops recording and reports `RecordOverrun` rather than overwriting
+   older samples.
+6. Offers telemetry to the one-slot `DataQueue`; a try-lock/connection failure
+   increments `dropped_telemetry_` without blocking the audio worker.
+7. On shutdown, stops playback production, closes ALSA handles, and marks the
+   worker not ready.
 
-`play_file(path, descriptor, ready)` opens the already-secured file descriptor
-using libsndfile, validates mono/8000 Hz/WAV/PCM16 format, repeatedly reads at
-most one 512-sample block, and pushes it into `playback_data_`. The first
-successful read (or immediate EOF) signals the readiness promise. It sets
-`playback_eof_`, closes the sound-file object and descriptor, and publishes
-read/finalization errors when necessary.
+The audio worker never opens WAV files; FileIO owns libsndfile and fills the
+playback FIFO. The audio thread owns both ALSA handles for its lifetime.
 
 ### `FileIOManager.cpp`
 
-The worker's `run()` holds the libsndfile file handle locally, so only the file
-thread owns that active recording handle.
+`storage_ready(options)` checks the configured directory and, by default, checks
+`/proc/self/mountinfo` to require an exact mounted path. `mounted_source()` maps
+that mountpoint back to the device node so a later udev removal can be matched.
+The helper `unescape_mount_path()` decodes mountinfo's escaped spaces and
+backslashes.
 
-- Start closes any prior active handle, configures WAV PCM16 mono 8 kHz, and
-  opens the supplied descriptor. On failure it closes/removes the incomplete
-  path, sets DiskFull or OpenError, clears recording state, and fulfills the
-  promise false. On success it sets recording state and fulfills true.
-- Samples checks the mount before writing. Storage removal closes the file and
-  reports StorageLost. A short/failed libsndfile write closes the file and
-  reports DiskFull or WriteError.
-- Stop flushes/synchronizes and closes the file and descriptor, then fulfills
-  the optional result promise.
-- Barrier fulfills a void promise after all earlier work items have been
-  processed.
-- Thread exit flushes/closes any remaining file.
+`run()` owns the recording/playback `SNDFILE*` handles and raw file descriptors.
+It posts initial storage flags, waits on the one-request mailbox at 10 ms
+intervals, dispatches requests, and services active FIFOs:
 
-`start()` and `finish()` use promises because the caller needs to know whether a
-start/stop completed. `push()` does not wait for disk I/O; it only enqueues
-work. The queue is a deque bounded operationally by checks against
-`kMaxPendingAudioBlocks`, not a separate `CircularBuffer`.
+- `OpenRecording` uses exclusive file creation and opens mono 8 kHz PCM16 WAV.
+  `RecordingOpened` tells Main whether start succeeded.
+- `write_recording()` checks storage, pops a partial-or-full 512-sample segment,
+  writes it, and retains `StorageLost`, `DiskFull`, or `WriteError` for final
+  completion.
+- `CloseRecording` closes the producer gate, drains remaining samples, syncs,
+  checks libsndfile's error state, closes both handles, and posts
+  `RecordingClosed`.
+- `PreparePlayback` checks the archive identity before and after `open()` with
+  `O_NOFOLLOW`, validates mono/8 kHz/WAV/PCM16, starts the playback FIFO, and
+  posts `PlaybackReady`.
+- `read_playback()` fills only free FIFO capacity; `StopPlayback` closes and
+  clears that stream and posts `PlaybackClosed`.
+- `List` returns sorted WAV identities; `Delete` verifies the same identity
+  before unlinking; `Eject` syncs and unmounts only through this worker.
+- `Mount` mounts the detected USB filesystem at the configured storage path.
+  `DeviceRemoved` stops writers/readers, closes their handles, marks storage
+  unavailable, and attempts cleanup of the mount.
+- `RefreshStorage` recomputes mounted/readable/writable/space flags.
+
+All completions and errors go to Main through `CommandQueue`; FileIO does not
+send TCP frames or change Main's transport/LED state.
 
 ### `LedDriver.cpp`
 
@@ -598,93 +591,59 @@ write must transfer exactly one byte; short writes and errors are logged.
 
 ### `SystemController.cpp`
 
-The constructor stores the `Options` reference and initializes `led_driver`
-from its device path and `writer` from the shared error/recording/overrun
-variables.
+The constructor wires shared queues, two sample FIFOs, the LED device,
+FileIOManager, and NetworkManager. `initSystem()` initializes a libudev block
+monitor, initializes LEDs and AudioDSP, waits up to five seconds for audio
+startup, then starts Network. `run()` requests Main core 0 and is the four-way
+coordinator: it waits up to 10 ms for a `MainMessage`, checks USB device events,
+dispatches deferred storage requests, and refreshes storage flags periodically.
 
-`update_leds()` loads atomic mode/recording values, writes the complete LED
-mask, and stores the inverse success result in `led_error`.
+`process_command()` validates each command and rejects a conflicting command
+while an asynchronous operation is pending. Start/stop recording, playback,
+archive listing/deletion, and eject each create a `PendingOperation` with a
+unique ID; worker responses advance that state machine. `complete_operation()`
+emits the final `CommandResult`, `Status`, and `State`. `handle_archive_result()`
+maintains connection-local file IDs and paging. The `publish_*` functions add
+already-encoded frames to Network's control queue. `set_error()` and
+`update_leds()` maintain error indication and authoritative LED masks.
 
-`refresh_runtime_state()` changes Playback to Live once `audio->playing()` is
-false. It changes Recording to Live when the file worker clears `recording`,
-clears `active_session`, and updates LEDs.
+`init_udev_monitor()` creates and enables the block-device monitor;
+`check_usb_events()` only consumes relevant USB block events; and
+`dispatch_deferred_mount()` retries a storage request if the FileIO mailbox is
+temporarily occupied. Main requests mount/removal work but never mounts or
+opens WAV files directly. `stop()` stops and joins the network/audio/file
+workers, frees udev objects, and closes LEDs.
 
 ### `main.cpp`
 
-`parse_options(argc, argv, options)` handles `--help`, `--allow-unmounted-storage`,
-`--bind`, `--port`, `--capture-pcm`, `--playback-pcm`, `--storage`, and
-`--led-device`. It checks port conversion/range and rejects missing or unknown
-options.
-
-`handle_signal` sets global `running` false. `main` parses options, registers
-SIGINT/SIGTERM handling, constructs `SystemController`, attempts to open/update
-LEDs, creates the audio engine, runs the network server, then stops audio,
-finalizes/stops the writer, clears session state, closes LEDs, and returns the
-server result.
+`handle_signal` sets global `running` false for SIGINT/SIGTERM. `main` parses
+options, constructs `SystemController`, calls `initSystem()`, runs Main's
+message loop, and returns after the controller has stopped and joined workers.
+`parse_options()` supports `--help`, `--allow-unmounted-storage`, `--bind`,
+`--port`, `--capture-pcm`, `--playback-pcm`, `--storage`, and `--led-device`;
+it rejects missing values, unknown flags, and ports outside 1–65535.
 
 ### `NetworkManager.cpp`
 
-The file-local `send_all(fd, data)` keeps sending until every byte is sent or
-the 100 ms deadline expires. It retries interrupted calls, uses `poll` when a
-nonblocking/temporarily blocked socket cannot accept bytes, suppresses SIGPIPE,
-and returns false on disconnect or terminal error.
+`ControlOutputQueue` keeps status/state/results/archive frames separate from
+telemetry. `send_all()` transmits a complete frame within a cumulative 100 ms
+deadline, retrying interrupts and polling briefly when the socket would block.
+`serve_client()` polls one client, accumulates incoming bytes until complete
+five-byte commands are available, decodes them, and puts them on
+`CommandQueue`; it does not validate command state or access storage. Each
+client gets fresh connection-local archive IDs. Network sends queued control
+frames before the newest optional telemetry snapshot and clears per-client
+queues on connect/disconnect.
 
-`storage_has_space(options)` requires at least 1 MiB free.
-`list_recordings(options)` returns sorted `.wav` filenames only when storage is
-ready. `status_packet(runtime)` calculates mounted/record/playback capability
-flags and the highest relevant error. `state_packet(runtime)` snapshots mode
-and gain under a mutex, calculates storage bits, clamps serialized values to
-protocol ranges, and emits transport/session/counter state.
-
-`send_archive(fd, runtime, cursor, error_code)` scans recordings, verifies
-regular-file metadata, assigns or refreshes connection-local file IDs, detects
-changed/stale entries, constructs a bounded page (up to 32 entries/8192 bytes),
-and sends it. The cursor is the last file ID from the previous page; zero means
-start. It reports StaleFileId when a nonzero cursor is not in the current
-archive.
-
-`reserve_recording_path(runtime)` creates a timestamped filename of the form
-`MODE_YYYYMMDD_HHMMSS_SESSION.wav`. It uses `O_CREAT|O_EXCL` to avoid
-overwriting an existing recording, increments the session ID, and stores the
-active session when creation succeeds.
-
-`handle_command(request, runtime)` validates arguments and transport before
-acting:
-
-- SetMode and SetGain update protected configuration (SetMode also updates
-  LEDs).
-- StartRecording requires a ready microphone and Live transport, verifies
-  storage, reserves a unique path, synchronously waits for `writer.start`, then
-  marks recording/transport and LEDs.
-- StopRecording changes to Stopping, stops production, waits for file finalizing,
-  returns to Live and clears the active session.
-- PlayAudio looks up the connection-local ID, validates path/metadata, opens
-  with `O_NOFOLLOW`, verifies descriptor metadata, starts playback and moves to
-  Playback.
-- StopPlayback cancels playback and returns to Live.
-- EjectStorage stops playback/recording, waits for file completion, syncs the
-  filesystem, closes its descriptor, and calls `umount2`.
-- GetArchive returns an ordinary completed result; the archive page is sent by
-  `serve_client`.
-- DeleteRecording validates ID/metadata and Live/storage state before removing
-  the file.
-
-`serve_client(fd, runtime)` configures socket timeouts, resets archive IDs for
-the new client, sends initial status/state, then polls one TCP client. Incoming
-bytes are accumulated; each five-byte command is decoded and handled. For
-GetArchive, it sends a page before the command result. Approximately every
-64 ms, it sends status, state, and telemetry. It refreshes runtime state and LED
-error indication while connected and closes the client on exit.
-
-`NetworkManager::run(controller)` creates an IPv4 TCP socket, binds to the
-configured address/port, listens with backlog one, and polls/accepts clients.
-It calls `serve_client` directly, so it serves one client at a time rather than
-creating a separate Network thread.
+`run()` requests core 3/SCHED_OTHER, creates an IPv4 listener with backlog one,
+posts `NetworkStarted`, and accepts one client at a time. Socket send/receive
+and poll failures are logged and surfaced as worker events. Only this worker
+writes TCP sockets.
 
 ### C++ tests
 
-- `architecture_test.cpp` checks ring-buffer ordering after overwrite, command
-  queue push/pop, and playback-block queue push/pop.
+- `architecture_test.cpp` checks non-overwriting FIFO behavior, MainMessage
+  command dispatch, and latest-snapshot/disconnect semantics for telemetry.
 - `band_pass_filter_test.cpp` synthesizes 8 kHz sine waves and calculates output
   RMS after a transient skip. It checks that Lung attenuates 50 Hz, Heart
   attenuates 1500 Hz, and all modes pass 500 Hz reasonably strongly.
@@ -881,9 +840,9 @@ ID. Archive page zero starts listing; later pages use the previous page's
 - **File list (`0x03`)** is UTF-8 text with a cursor line and tab-separated IDs
   and WAV basenames.
 
-The protocol defines `AcceptedPending`, but the current server's command
-handlers generally wait for their operation and reply synchronously. The GUI
-still has logic for a pending result because the protocol can represent one.
+Long-running server operations first return `AcceptedPending`; Main posts a
+final completed/failed result after the relevant FileIO/AudioDSP responses are
+collected. Invalid or conflicting commands are rejected immediately.
 
 ### Recording and files
 
@@ -920,48 +879,38 @@ the final hardware.
 | Audio format and block | Mono PCM16 at 8 kHz, 512-sample blocks | Matches `configure_pcm` and `kPeriodFrames`; block duration is 64 ms, not a latency measurement. |
 | Filter bands | General 20–2000 Hz, Heart 20–600 Hz, Lung 100–1000 Hz | Matches `filter_limits` and the UI labels. The implementation uses cascaded high-pass and low-pass biquads, fixed gain, and PCM16 saturation. |
 | FFT | 1024-sample history, Hann window, frequency spectrum | The code uses a 1024-point FFT with Hann weighting for spectrum and sends 512 magnitude bins. It omits the 513th real-FFT bin. |
-| Main/network threading | Report describes separate `th_Main` and `th_Network`, with command/result dispatch through a `MainMessage` queue | There is no `MainMessage` type or distinct Network worker. `main()` calls `NetworkManager::run()` on the main thread; it accepts and serves one client directly. |
-| Thread count | Report specifies four primary threads: Main, AudioDSP, FileIO, Network | Current baseline is main/network together, AudioEngine worker, and FileIO worker. Playback starts an additional file-reader thread. Audio requests core 1/FIFO 80; FileIO does not request core 2/FIFO 50; Network has no dedicated core. |
-| Command decoding and routing | Report's NetworkManager receives/assembles five command bytes and decodes them into a `CommandPacket`; Main then validates/routes the decoded command and coordinates worker requests/results. | `serve_client` calls `decode_command` and then calls `handle_command` itself. So the current NetworkManager performs both byte-level decoding and command decisions; there is no separate Main command dispatcher. It pushes then immediately pops `CommandQueue` in that same call path; this is not cross-thread dispatch. |
-| Pending results | Report allows `ACCEPTED_PENDING` followed by a final result | `Result::AcceptedPending` is defined and decoded, but current C++ command paths return completed/rejected/failed after their synchronous work; no path was found that emits AcceptedPending. |
-| Recording buffer | Report describes a synchronized 4096-sample circular recording buffer shared with FileIO | Current `CircularBuffer` is a plain, non-thread-safe FFT history buffer. Recording blocks are copied into `FileIOManager`'s mutex-protected deque; `kMaxPendingAudioBlocks` is 7. Queue overload stops recording and reports an overrun instead of silently overwriting. |
-| `DataQueue` | The report's architecture guide calls it a telemetry/display-snapshot queue | In the source, `DataQueue` is the eight-block playback-audio queue used by `AudioEngine`. Telemetry is one shared `Telemetry` snapshot protected by a mutex. |
-| File responsibilities | Report assigns broad storage/archive/eject work to FileIO | `FileIOManager` owns active WAV recording writes. `NetworkManager` itself lists archives, checks file identity, handles playback file opening flow, deletes files, syncs, and unmounts. This differs from the report's single FileIO storage owner. |
-| Playback | Report describes FileIO preparing playback data and AudioDSP consuming it | The current `AudioEngine::play_file` thread opens/reads the WAV through libsndfile and places samples in `playback_data_`; the audio worker consumes those blocks. |
+| Main/network threading | Separate Main and Network threads, connected by decoded messages and worker results | Implemented: Main dispatches `MainMessage`s; the Network worker only handles sockets/protocol framing and enqueues decoded commands. |
+| Thread count and placement | Four primary threads: Main/core 0, AudioDSP/core 1/FIFO 80, FileIO/core 2/FIFO 50, Network/core 3/SCHED_OTHER | Implemented as four primary worker contexts. The affinity/priority calls are best-effort and log failures; actual placement and real-time privileges still require target verification. |
+| Command decoding and routing | Network assembles five-byte commands; Main validates, routes, and owns authoritative state | Implemented: `serve_client()` decodes and posts a `CommandPacket`; only `SystemController` processes command semantics and commits transport/LED state. |
+| Pending results | `ACCEPTED_PENDING` followed by a final command result for asynchronous work | Implemented for stateful worker operations using operation IDs and a Main-side pending-operation state machine. |
+| Recording buffer | Synchronized 4096-sample shared ring/FIFO; producer must not overwrite data; stop gate and final drain | Implemented with a dedicated 4096-sample non-overwriting FIFO. AudioDSP pushes; FileIO drains and reports full-buffer/write/storage failures. A distinct same-sized playback FIFO carries samples the other direction. |
+| `DataQueue` | Single latest telemetry/display snapshot; never let a slow socket block AudioDSP | Implemented as a one-slot replaceable telemetry queue, enabled only for a connected client and accessed by AudioDSP with a try-lock. |
+| Other queues | Main command/result FIFO, separate worker mailboxes, and Network control-output FIFO | Implemented as distinct queues with distinct payloads and responsibilities; control/status frames are serviced before telemetry. |
+| File responsibilities | FileIO owns recording, playback preparation, archive, deletion, mount, sync, and eject | Implemented in FileIO. It owns WAV handles and storage operations; Network sends bytes only and Main coordinates requests/results. |
+| Playback | FileIO prepares/fills playback data; AudioDSP consumes it | Implemented with FileIO as producer of the playback FIFO and AudioDSP as its consumer. There is no separate per-playback file-reader thread. |
+| USB storage events | Main uses udev and requests FileIO mount/cleanup without doing storage I/O in the event loop | Implemented with libudev block-device events. Main filters for USB ancestry, submits mount/removal requests, and retries when FileIO's mailbox is occupied. Exact target udev rules, privileges, and supported filesystems must be verified on the Pi. |
 | LED control | Report/deck describes a custom one-byte LED character driver and complete status masks | Implemented by `LedDriver.cpp` plus `phonostethos_leds.c`, with mode/recording masks and a temporary `0xff` error pulse. Physical LED illumination is not sensed. |
 | TCP/protocol | Report specifies explicit endian-safe commands, state/status, telemetry, archive frames, and validation | C++ `protocol.h` and Dart `protocol.dart` implement matching layouts, length checks, values, and partial-frame handling. |
 | GUI | Report/deck shows live plots, controls, and an archive | `main.dart` has waveform and dBFS spectrum charts, mode/gain controls, recording/playback/eject actions, and archive play/delete. |
 | Safe eject | Report describes stopping work, flushing, then unmounting | `EjectStorage` stops playback, finalizes recording, calls `syncfs`, then `umount2`. Requires correct privileges and target filesystem support. |
 | Buildroot/platform work | Report includes Buildroot image, kernel/driver, device-tree, startup and hardware assumptions | The repository has Buildroot-oriented Makefile paths, driver, overlay, and deployment files. The source alone does not prove that the configured Pi image, USB gadget, sound card, storage mount, GPIO wiring, or power arrangement is operational. |
-| Tests | Report's test matrix marks hardware tests “Not tested” and describes planned manual checks | Three C++ tests and Dart protocol tests exist. Passing software tests do not validate microphone hardware, sound quality, latency, USB removal, LED wiring, or clinical accuracy. |
+| Tests | Report's test matrix describes manual audio, recording, playback, USB removal/eject, reconnect, and sustained-load tests | The three native C++ tests pass and the full server compiles. They do not prove the Pi's audio hardware, udev/mount permissions, real-time scheduling, sound quality, latency, USB removal safety, LED wiring, or clinical accuracy. |
 
-### The most important architectural differences
+### Match status and remaining verification
 
-The formal report and the explanation guide describe a planned ownership model:
-Network assembles and decodes the wire command into a `CommandPacket`, then queues
-it; Main validates and routes that command, specialized workers perform operations,
-and Main commits the final state. The checked-in implementation is simpler and more
-synchronous:
-
-- `NetworkManager::run` and `serve_client` execute on the original main thread.
-- `handle_command` performs command work directly from `serve_client`.
-- `CommandQueue` currently does not transfer a request to a separate Main
-  dispatcher.
-- There is no `MainMessage`, worker-result protocol, separate Network thread,
-  USB event monitor, or shared recording `CircularBuffer` in the checked-in
-  application.
-- File recording is asynchronous at the write-block level, but Start and Stop
-  wait for promises from the file worker before reporting their result.
-
-Thus, parts of the report are best read as the target architecture/specification,
-not as a literal explanation of every current implementation detail. If the
-report is intended to claim the four-thread asynchronous design is already
-implemented, it should be revised to match the code or the code should be
-extended to match the report.
+The source has now been refactored to follow the report's core thread ownership,
+queue separation, command/result flow, and storage responsibilities. This is a
+source-level architecture match, not a claim that the system has passed every
+report acceptance test. In particular, hardware/Buildroot deployment, the
+actual USB audio device, udev permissions and supported filesystem modules,
+safe physical removal, LED circuitry, scheduling privileges, and sustained
+audio latency still need Raspberry Pi testing. The report's manual test cases
+remain the acceptance checklist.
 
 ## 11. Build and verification notes
 
-The C++ app uses C++17 and depends on Threads, ALSA, FFTW3f, and libsndfile.
+The C++ app uses C++17 and depends on Threads, ALSA, FFTW3f, libsndfile, and
+libudev.
 The native test targets can be configured without the hardware server
 dependencies:
 
@@ -972,10 +921,10 @@ cmake --build /tmp/phonostethos-build --parallel
 ctest --test-dir /tmp/phonostethos-build --output-on-failure
 ```
 
-In this workspace, those three native C++ tests passed after the namespace
-change. A full server configuration was not possible in the host environment
-because the ALSA development package was missing. The Flutter/Dart tests and
-the target Raspberry Pi build were not run as part of creating this guide.
+In this workspace, all three native C++ tests passed, and the complete server
+compiled with the required development libraries. The Flutter/Dart tests and
+the target Raspberry Pi/hardware acceptance tests were not run as part of this
+refactor.
 
 The root `Makefile` is specific to a configured Buildroot toolchain and kernel
 tree. The Flutter project has its own `pubspec.yaml`, lockfile, Linux runner,

@@ -22,7 +22,9 @@ bool DspProcessor::initialize() {
 }
 
 void DspProcessor::reset() {
-    history_.clear();
+    history_.fill(0.0F);
+    history_next_ = 0;
+    history_size_ = 0;
     filter_.reset();
     configured_mode_ = 99;
     frames_since_fft_ = 0;
@@ -47,14 +49,18 @@ void DspProcessor::process_live(const int16_t* input,
 optional<Telemetry> DspProcessor::analyze(const int16_t* samples,
                                                 size_t count) {
     for (size_t i = 0; i < count; ++i) {
-        history_.push(static_cast<float>(samples[i]) / 32768.0F);
+        history_[history_next_] = static_cast<float>(samples[i]) / 32768.0F;
+        history_next_ = (history_next_ + 1) % kFftFrames;
+        history_size_ = min(history_size_ + 1, kFftFrames);
     }
     frames_since_fft_ += count;
-    if (frames_since_fft_ < kPeriodFrames || history_.size() < kFftFrames) {
+    if (frames_since_fft_ < kPeriodFrames || history_size_ < kFftFrames) {
         return nullopt;
     }
     frames_since_fft_ %= kPeriodFrames;
-    history_.copy_ordered(waveform_);
+    for (size_t i = 0; i < kFftFrames; ++i) {
+        waveform_[i] = history_[(history_next_ + i) % kFftFrames];
+    }
 
     float window_sum = 0.0F;
     for (size_t i = 0; i < kFftFrames; ++i) {

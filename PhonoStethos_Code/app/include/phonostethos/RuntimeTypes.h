@@ -17,8 +17,7 @@ constexpr unsigned kSampleRate = 8000;
 constexpr size_t kPeriodFrames = 512;
 constexpr size_t kFftFrames = 1024;
 constexpr size_t kFftBins = 512;
-constexpr size_t kMaxPendingAudioBlocks = 7;
-constexpr size_t kPlaybackCapacityBlocks = 8;
+constexpr size_t kCircularBufferSamples = 4096;
 constexpr double kPi = 3.14159265358979323846;
 constexpr const char* kLedDevice = "/dev/phonostethos_leds";
 extern atomic<bool> running;
@@ -44,11 +43,6 @@ bool storage_ready(const Options& options);
 struct Telemetry {
     array<float, kFftFrames> waveform{};
     array<float, kFftBins> spectrum{};
-};
-
-struct PlaybackBlock {
-    array<int16_t, kPeriodFrames> samples{};
-    size_t count = 0;
 };
 
 struct ArchiveIdentity {
