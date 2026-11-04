@@ -31,8 +31,8 @@ enum class FilterMode : unsigned {
 struct Options {
     string bind_address = "10.42.0.3";
     uint16_t port = 8080;
-    string capture_pcm = "default";
-    string playback_pcm = "default";
+    string capture_pcm = "plughw:CARD=HiFiAudio,DEV=0";
+    string playback_pcm = "plughw:CARD=Headphones,DEV=0";
     filesystem::path storage = "/media/usb_storage";
     string led_device = kLedDevice;
     bool require_mounted_storage = true;

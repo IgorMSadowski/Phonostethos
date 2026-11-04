@@ -168,8 +168,30 @@ bool AudioEngine::apply_request(snd_pcm_t*& capture, Request request,
             return true;
         }
         case RequestKind::ResumeCapture: {
-            const int result = snd_pcm_prepare(capture);
+            int result = 0;
+            {
+                lock_guard<mutex> lock(capture_mutex_);
+                capture_pcm_.store(nullptr);
+                if (capture != nullptr) {
+                    result = snd_pcm_close(capture);
+                    capture = nullptr;
+                }
+                if (result >= 0) {
+                    result = snd_pcm_open(&capture,
+                                          options_.capture_pcm.c_str(),
+                                          SND_PCM_STREAM_CAPTURE, 0);
+                }
+                if (result >= 0) result = configure_pcm(capture);
+                if (result < 0 && capture != nullptr) {
+                    snd_pcm_close(capture);
+                    capture = nullptr;
+                }
+                capture_pcm_.store(capture);
+            }
             if (result < 0) {
+                cerr << "Cannot reopen capture PCM '"
+                     << options_.capture_pcm << "': " << snd_strerror(result)
+                     << '\n';
                 error_code_.store(static_cast<unsigned>(Error::MicLost));
                 post_result(WorkerResultCode::CaptureResumed,
                             request.operation_id,

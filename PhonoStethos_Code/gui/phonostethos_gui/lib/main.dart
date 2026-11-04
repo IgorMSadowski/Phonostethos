@@ -662,6 +662,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                     ],
                   ),
+                  duration: Duration.zero,
                 ),
               ),
             ],

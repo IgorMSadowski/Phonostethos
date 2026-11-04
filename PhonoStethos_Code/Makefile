@@ -4,12 +4,11 @@ TOOLCHAIN_FILE := $(abspath app/cmake/buildroot-aarch64.cmake)
 KERNEL_DIR ?= $(BUILDROOT_DIR)/output/build/linux-custom
 HOST_DIR := $(BUILDROOT_DIR)/output/host
 OVERLAY_DIR ?= $(BUILDROOT_DIR)/output/target
-DTB_OUTPUT := kernel-driver/build/phonostethos-status-leds.dtbo
 KERNEL_RELEASE = $(shell $(MAKE) -s -C $(KERNEL_DIR) kernelrelease)
 
-.PHONY: all configure build driver overlay install clean
+.PHONY: all configure build driver install clean
 
-all: build driver overlay
+all: build driver
 
 configure:
 	cmake -S app -B $(BUILD_DIR) \
@@ -26,21 +25,11 @@ driver:
 		CROSS_COMPILE=$(HOST_DIR)/bin/aarch64-linux- \
 		ARCH=arm64
 
-overlay: $(DTB_OUTPUT)
-
-$(DTB_OUTPUT): kernel-driver/phonostethos-status-leds-overlay.dts
-	mkdir -p kernel-driver/build
-	$(HOST_DIR)/bin/aarch64-linux-cpp -nostdinc \
-		-I$(KERNEL_DIR)/include -undef -x assembler-with-cpp $< | \
-		$(HOST_DIR)/bin/dtc -@ -I dts -O dtb -o $@ -
-
-install: build driver overlay
+install: build driver
 	install -D -m 0755 $(BUILD_DIR)/phonostethos-server \
 		$(OVERLAY_DIR)/usr/bin/phonostethos-server
 	install -D -m 0644 kernel-driver/phonostethos_leds.ko \
 		$(OVERLAY_DIR)/lib/modules/$(KERNEL_RELEASE)/extra/phonostethos_leds.ko
-	install -D -m 0644 $(DTB_OUTPUT) \
-		$(OVERLAY_DIR)/boot/overlays/phonostethos-status-leds.dtbo
 	install -D -m 0644 kernel-driver/phonostethos-leds.rules \
 		$(OVERLAY_DIR)/etc/udev/rules.d/99-phonostethos-leds.rules
 	install -D -m 0644 kernel-driver/phonostethos-usb.rules \
@@ -53,5 +42,5 @@ install: build driver overlay
 		$(OVERLAY_DIR)/etc/init.d/S90phonostethos
 
 clean:
-	rm -rf app/build app/build-pi kernel-driver/build
+	rm -rf app/build app/build-pi
 	$(MAKE) -C kernel-driver KDIR=$(KERNEL_DIR) clean

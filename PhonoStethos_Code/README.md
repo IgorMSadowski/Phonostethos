@@ -19,7 +19,12 @@ gui/
 
 The C++ server uses ALSA for PCM I/O, FFTW3f for the spectrum, libsndfile for
 WAV files, and the custom LED character device. It processes mono PCM16 at
-8 kHz in 512-sample periods.
+8 kHz in 512-sample periods. By default, capture uses the USB audio interface
+named `HiFiAudio`, and playback uses the Pi headphone output named
+`Headphones`. These ALSA names match the Pi 4 setup; override them with
+`--capture-pcm` or `--playback-pcm` if the hardware reports different card
+names. The `plughw` devices let ALSA adapt the hardware format to the server's
+mono 8 kHz stream.
 
 Install the ALSA, FFTW3f, and libsndfile development packages, then build and
 test the protocol and queue utilities:
@@ -35,17 +40,24 @@ the configured Buildroot toolchain and kernel tree.
 
 ## Kernel driver
 
-The driver source is `kernel-driver/phonostethos_leds.c`. Build it against the
-exact target kernel headers with:
+The driver source is `kernel-driver/phonostethos_leds.c`. It creates
+`/dev/phonostethos_leds` when the module loads and directly controls the
+Raspberry Pi 4 BCM2711 GPIO registers. It does not depend on a device-tree
+overlay. The LED mask is HEART `0x01` / BCM17, LUNG `0x02` / BCM27, GENERAL
+`0x04` / BCM24, and recording `0x08` / BCM22. This driver is specific to the
+Pi 4 BCM2711 GPIO register mapping.
+
+Build it against the exact target kernel headers with:
 
 ```sh
 make -C kernel-driver KDIR=/path/to/linux \
   CROSS_COMPILE=/path/to/toolchain/bin/aarch64-linux- ARCH=arm64
 ```
 
-The root `Makefile` also compiles and stages the device-tree overlay, udev
-permissions, and init script. The LED mask is HEART `0x01` / BCM17, LUNG
-`0x02` / BCM27, GENERAL `0x04` / BCM24, and recording `0x08` / BCM22.
+The root `Makefile` stages the kernel module, udev permissions, and init
+script. Loading the module creates the character device; the overlay file
+`kernel-driver/phonostethos-status-leds-overlay.dts` is not needed by this
+driver.
 
 The server stores recordings on the drive mounted at `/media/usb_storage`.
 The Buildroot overlay installs an eudev rule to mount USB FAT32
