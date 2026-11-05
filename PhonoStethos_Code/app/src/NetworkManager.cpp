@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -20,56 +21,63 @@
 using namespace std;
 
 namespace phono_app {
-void ControlOutputQueue::enqueue(vector<uint8_t> frame) {
-    lock_guard<mutex> lock(mutex_);
+void ControlReplyQueue::enqueue(vector<uint8_t> frame) {
+    PthreadLock lock(mutex_);
     queue_.push_back(move(frame));
 }
 
-bool ControlOutputQueue::try_dequeue(vector<uint8_t>& frame) {
-    lock_guard<mutex> lock(mutex_);
+bool ControlReplyQueue::try_dequeue(vector<uint8_t>& frame) {
+    PthreadLock lock(mutex_);
     if (queue_.empty()) return false;
     frame = move(queue_.front());
     queue_.pop_front();
     return true;
 }
 
-void ControlOutputQueue::clear() {
-    lock_guard<mutex> lock(mutex_);
+void ControlReplyQueue::clear() {
+    PthreadLock lock(mutex_);
     queue_.clear();
 }
 
 NetworkManager::NetworkManager(const Options& options, CommandQueue& messages,
-                               DataQueue& telemetry,
-                               ControlOutputQueue& output)
+                               DataQueue& telemetry)
     : options_(options),
       messages_(messages),
-      telemetry_(telemetry),
-      output_(output) {}
+      telemetry_(telemetry) {}
 
 NetworkManager::~NetworkManager() { stop(); }
 
+// pthread_create expects a C-style callback; recover this NetworkManager from void*.
+void* NetworkManager::threadEntry(void* context) {
+    static_cast<NetworkManager*>(context)->run();
+    return nullptr;
+}
+
 void NetworkManager::start() {
-    if (worker_.joinable()) return;
+    if (worker_started_) return;
     stop_requested_.store(false);
-    try {
-        worker_ = thread(&NetworkManager::run, this);
-    } catch (const system_error& error) {
-        cerr << "Cannot start network thread: " << error.what() << '\n';
-        post_network_event(
-            WorkerResultCode::NetworkFailed,
+    const int result = pthread_create(&worker_, nullptr, &NetworkManager::threadEntry, this);
+    if (result != 0) {
+        cerr << "Cannot start Network thread: " << strerror(result) << '\n';
+        post_network_event(WorkerResultCode::NetworkFailed,
             static_cast<uint8_t>(phono::protocol::Error::NetworkError));
+        return;
     }
+    worker_started_ = true;
 }
 
 void NetworkManager::stop() {
     stop_requested_.store(true);
-    if (worker_.joinable()) worker_.join();
+    if (worker_started_) {
+        pthread_join(worker_, nullptr);
+        worker_started_ = false;
+    }
 }
 
 bool NetworkManager::connected() const { return connected_.load(); }
 
 void NetworkManager::queue_control(vector<uint8_t> frame) {
-    output_.enqueue(move(frame));
+    control_replies_.enqueue(move(frame));
 }
 
 void NetworkManager::post_network_event(WorkerResultCode code, uint8_t error) {
@@ -82,6 +90,12 @@ void NetworkManager::post_network_event(WorkerResultCode code, uint8_t error) {
 }
 
 void NetworkManager::set_network_thread_policy() {
+    // Main and Network are peers: SCHED_OTHER priority 0, nice 0.
+    sched_param normal_priority{};
+    const int policy_error = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority);
+    if (policy_error != 0) cerr << "Cannot set normal scheduling: " << strerror(policy_error) << '\n';
+    if (setpriority(PRIO_PROCESS, 0, 0) != 0) cerr << "Cannot set nice 0: " << strerror(errno) << '\n';
+
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
     CPU_SET(3, &cpus);
@@ -91,21 +105,17 @@ void NetworkManager::set_network_thread_policy() {
         cerr << "Network thread CPU affinity not set: " << strerror(result)
                   << '\n';
     }
-    sched_param priority{};
-    const int scheduling_result =
-        pthread_setschedparam(pthread_self(), SCHED_OTHER, &priority);
-    if (scheduling_result != 0) {
-        cerr << "Network thread SCHED_OTHER unavailable: "
-                  << strerror(scheduling_result) << '\n';
-    }
+
 }
 
+// A TCP write can be partial: finish this frame before another frame is sent.
 bool NetworkManager::send_all(int socket_fd,
                               const vector<uint8_t>& frame) {
     size_t sent = 0;
     const auto deadline =
         chrono::steady_clock::now() + chrono::milliseconds(100);
     while (sent < frame.size() && !stop_requested_.load()) {
+        if (chrono::steady_clock::now() >= deadline) return false;
         const auto count = ::send(socket_fd, frame.data() + sent,
                                   frame.size() - sent, MSG_NOSIGNAL);
         if (count < 0) {
@@ -136,6 +146,7 @@ bool NetworkManager::send_all(int socket_fd,
     return sent == frame.size();
 }
 
+// One GUI client: send one control/telemetry frame, then check for incoming commands.
 void NetworkManager::serve_client(int socket_fd) {
     timeval timeout{};
     timeout.tv_usec = 10000;
@@ -148,19 +159,16 @@ void NetworkManager::serve_client(int socket_fd) {
         return;
     }
 
-    vector<uint8_t> command_bytes;
-    command_bytes.reserve(phono::protocol::kCommandBytes);
-    bool connected = true;
-    while (connected && !stop_requested_.load() && running.load()) {
+    bytes_received_ = 0;
+    client_alive_ = true;
+    while (client_alive_ && !stop_requested_.load() && running.load()) {
         vector<uint8_t> control;
-        if (output_.try_dequeue(control)) {
+        if (control_replies_.try_dequeue(control)) {
             if (!send_all(socket_fd, control)) break;
         } else if (const auto packet = telemetry_.try_dequeue();
                    packet.has_value()) {
             try {
-                if (!send_all(socket_fd, phono::protocol::make_data_packet(
-                                             packet->waveform,
-                                             packet->spectrum))) {
+                if (!sendData(*packet)) {
                     break;
                 }
             } catch (const exception& error) {
@@ -183,48 +191,22 @@ void NetworkManager::serve_client(int socket_fd) {
         if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
         if (!(event.revents & POLLIN)) continue;
 
-        array<uint8_t, 128> incoming{};
-        const auto count =
-            ::recv(socket_fd, incoming.data(), incoming.size(), 0);
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            cerr << "Client receive: " << strerror(errno) << '\n';
-            break;
-        }
-        command_bytes.insert(command_bytes.end(), incoming.begin(),
-                             incoming.begin() + count);
-        while (command_bytes.size() >= phono::protocol::kCommandBytes) {
-            phono::protocol::CommandPacket command;
-            if (!phono::protocol::decode_command(
-                    command_bytes.data(), phono::protocol::kCommandBytes,
-                    command)) {
-                cerr << "Closing client after invalid command frame\n";
-                connected = false;
-                break;
-            }
-            messages_.enqueue(command);
-            command_bytes.erase(
-                command_bytes.begin(),
-                command_bytes.begin() + phono::protocol::kCommandBytes);
-        }
+        phono::protocol::CommandPacket command;
+        if (receiveCommand(command)) messages_.enqueue(command);
     }
 }
 
-void NetworkManager::run() {
-    set_network_thread_policy();
-    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
+bool NetworkManager::startListening() {
+    server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd_ < 0) {
         cerr << "socket: " << strerror(errno) << '\n';
         post_network_event(
             WorkerResultCode::NetworkFailed,
             static_cast<uint8_t>(phono::protocol::Error::NetworkError));
-        return;
+        return false;
     }
     int reuse = 1;
-    (void)::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+    (void)::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse,
                        sizeof(reuse));
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -232,29 +214,73 @@ void NetworkManager::run() {
     if (::inet_pton(AF_INET, options_.bind_address.c_str(), &address.sin_addr) !=
         1) {
         cerr << "Invalid IPv4 bind address: " << options_.bind_address << '\n';
-        ::close(server_fd);
+        ::close(server_fd_);
+        server_fd_ = -1;
         post_network_event(
             WorkerResultCode::NetworkFailed,
             static_cast<uint8_t>(phono::protocol::Error::NetworkError));
-        return;
+        return false;
     }
-    if (::bind(server_fd, reinterpret_cast<sockaddr*>(&address),
+    if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&address),
                sizeof(address)) < 0 ||
-        ::listen(server_fd, 1) < 0) {
+        ::listen(server_fd_, 1) < 0) {
         cerr << "Cannot listen on " << options_.bind_address << ':'
                   << options_.port << ": " << strerror(errno) << '\n';
-        ::close(server_fd);
+        ::close(server_fd_);
+        server_fd_ = -1;
         post_network_event(
             WorkerResultCode::NetworkFailed,
             static_cast<uint8_t>(phono::protocol::Error::NetworkError));
-        return;
+        return false;
     }
+    return true;
+}
+
+// TCP has no message boundaries. Keep partial command bytes until all five arrive.
+bool NetworkManager::receiveCommand(phono::protocol::CommandPacket& command) {
+    const auto count = ::recv(client_fd_, command_bytes_.data() + bytes_received_,
+                              command_bytes_.size() - bytes_received_, 0);
+    if (count < 0) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) client_alive_ = false;
+        return false;
+    }
+    if (count == 0) { client_alive_ = false; return false; }
+    bytes_received_ += static_cast<size_t>(count);
+    if (bytes_received_ != command_bytes_.size()) return false;
+    bytes_received_ = 0;
+    if (!phono::protocol::decode_command(command_bytes_.data(), command_bytes_.size(), command)) {
+        client_alive_ = false;
+        return false;
+    }
+    return true;
+}
+
+bool NetworkManager::sendData(const Telemetry& packet) {
+    return send_all(client_fd_, phono::protocol::make_data_packet(packet.waveform, packet.spectrum));
+}
+
+// Main may call this method: queue the frame rather than writing from Main.
+bool NetworkManager::sendStatus(const phono::protocol::Status& status) {
+    queue_control(phono::protocol::make_status_packet(status));
+    return true;
+}
+
+bool NetworkManager::sendFileList(uint32_t cursor,
+                                 const vector<phono::protocol::FileEntry>& entries) {
+    queue_control(phono::protocol::make_file_list_packet(cursor, entries));
+    return true;
+}
+
+// This pthread is the sole owner of server_fd_ and client_fd_.
+void NetworkManager::run() {
+    set_network_thread_policy();
+    if (!startListening()) return;
     post_network_event(WorkerResultCode::NetworkStarted);
     cout << "PhonoStethos server listening on " << options_.bind_address << ':'
               << options_.port << '\n';
 
     while (!stop_requested_.load() && running.load()) {
-        pollfd listener{server_fd, POLLIN, 0};
+        pollfd listener{server_fd_, POLLIN, 0};
         const auto ready = ::poll(&listener, 1, 10);
         if (ready < 0) {
             if (errno == EINTR) continue;
@@ -264,27 +290,29 @@ void NetworkManager::run() {
         if (ready == 0 || !(listener.revents & POLLIN)) continue;
         sockaddr_in peer{};
         socklen_t peer_size = sizeof(peer);
-        const int client_fd =
-            ::accept(server_fd, reinterpret_cast<sockaddr*>(&peer), &peer_size);
-        if (client_fd < 0) {
+        client_fd_ =
+            ::accept(server_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        if (client_fd_ < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             cerr << "accept: " << strerror(errno) << '\n';
             continue;
         }
-        output_.clear();
+        control_replies_.clear();
         telemetry_.clear();
         connected_.store(true);
         telemetry_.set_connected(true);
         post_network_event(WorkerResultCode::ClientConnected);
-        serve_client(client_fd);
-        ::close(client_fd);
+        serve_client(client_fd_);
+        ::close(client_fd_);
+        client_fd_ = -1;
         connected_.store(false);
         telemetry_.set_connected(false);
-        output_.clear();
+        control_replies_.clear();
         post_network_event(WorkerResultCode::ClientDisconnected);
     }
-    ::close(server_fd);
+    ::close(server_fd_);
+    server_fd_ = -1;
 }
 }  // namespace phono_app

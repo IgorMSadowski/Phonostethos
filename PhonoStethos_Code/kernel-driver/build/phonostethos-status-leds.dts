@@ -1,0 +1,28 @@
+# 0 "phonostethos-status-leds-overlay.dts"
+# 0 "<built-in>"
+# 0 "<command-line>"
+# 1 "phonostethos-status-leds-overlay.dts"
+/dts-v1/;
+/plugin/;
+
+# 1 "/home/igor/buildroot/buildroot-2026.08/output/build/linux-custom/include/dt-bindings/gpio/gpio.h" 1
+# 5 "phonostethos-status-leds-overlay.dts" 2
+
+/ {
+ compatible = "brcm,bcm2711";
+
+ fragment@0 {
+  target-path = "/";
+
+  __overlay__ {
+   phonostethos-status-leds {
+    compatible = "phonostethos,status-leds";
+    heart-gpios = <&gpio 17 0>;
+    lung-gpios = <&gpio 27 0>;
+    recording-gpios = <&gpio 22 0>;
+    general-gpios = <&gpio 24 0>;
+    status = "okay";
+   };
+  };
+ };
+};

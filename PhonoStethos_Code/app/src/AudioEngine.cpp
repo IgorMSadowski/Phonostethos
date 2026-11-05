@@ -15,10 +15,10 @@ using namespace std;
 
 namespace phono_app {
 AudioEngine::AudioEngine(
-    const Options& options, atomic<unsigned>& mode, atomic<unsigned>& gain,
+    const Options& options, DspProcessor& dsp, atomic<unsigned>& mode, atomic<unsigned>& gain,
     atomic<bool>& recording, atomic<unsigned>& error_code,
     CommandQueue& messages, DataQueue& telemetry,
-    mutex& configuration_mutex,
+    pthread_mutex_t& configuration_mutex,
     CircularBuffer<int16_t, kCircularBufferSamples>& recording_buffer,
     CircularBuffer<int16_t, kCircularBufferSamples>& playback_buffer,
     atomic<uint32_t>& dropped_telemetry,
@@ -35,12 +35,37 @@ AudioEngine::AudioEngine(
       playback_buffer_(playback_buffer),
       dropped_telemetry_(dropped_telemetry),
       recording_overruns_(recording_overruns),
-      worker_(&AudioEngine::run, this) {}
+      dsp_(dsp) {
+    initializeMutex(request_mutex_);
+    initializeMutex(capture_mutex_);
+}
 
-AudioEngine::~AudioEngine() { stop(); }
+AudioEngine::~AudioEngine() {
+    stop();
+    pthread_mutex_destroy(&request_mutex_);
+    pthread_mutex_destroy(&capture_mutex_);
+}
 
+// pthread callback: context is the AudioEngine whose start() created this worker.
+void* AudioEngine::threadEntry(void* context) {
+    static_cast<AudioEngine*>(context)->run();
+    return nullptr;
+}
+
+bool AudioEngine::start() {
+    if (worker_started_) return true;
+    const int result = pthread_create(&worker_, nullptr, &AudioEngine::threadEntry, this);
+    if (result != 0) {
+        cerr << "Cannot start AudioEngine: " << strerror(result) << '\n';
+        return false;
+    }
+    worker_started_ = true;
+    return true;
+}
+
+// A mailbox holds one unprocessed control request; Main never changes ALSA directly.
 bool AudioEngine::request(Request request) {
-    lock_guard<mutex> lock(request_mutex_);
+    PthreadLock lock(request_mutex_);
     if (stop_requested_.load() || request_.has_value()) return false;
     request_ = request;
     return true;
@@ -51,12 +76,15 @@ bool AudioEngine::ready() const { return ready_.load(); }
 void AudioEngine::stop() {
     stop_requested_.store(true);
     {
-        lock_guard<mutex> lock(capture_mutex_);
+        PthreadLock lock(capture_mutex_);
         if (auto* capture = capture_pcm_.load(); capture != nullptr) {
             (void)snd_pcm_drop(capture);
         }
     }
-    if (worker_.joinable()) worker_.join();
+    if (worker_started_) {
+        pthread_join(worker_, nullptr);
+        worker_started_ = false;
+    }
 }
 
 int AudioEngine::configure_pcm(snd_pcm_t* pcm) {
@@ -149,12 +177,13 @@ void AudioEngine::post_result(WorkerResultCode code, uint32_t operation_id,
     messages_.enqueue(move(message));
 }
 
-bool AudioEngine::apply_request(snd_pcm_t*& capture, Request request,
+// Only AudioDSP executes these ALSA transitions, at an audio-block boundary.
+bool AudioEngine::apply_request(Request request,
                                bool& playback_active) {
     using phono::protocol::Error;
     switch (request.kind) {
         case RequestKind::SuspendCapture: {
-            const int result = snd_pcm_drop(capture);
+            const int result = suspendCapture() ? 0 : -EIO;
             if (result < 0) {
                 error_code_.store(static_cast<unsigned>(Error::MicLost));
                 post_result(WorkerResultCode::CaptureSuspended,
@@ -168,26 +197,7 @@ bool AudioEngine::apply_request(snd_pcm_t*& capture, Request request,
             return true;
         }
         case RequestKind::ResumeCapture: {
-            int result = 0;
-            {
-                lock_guard<mutex> lock(capture_mutex_);
-                capture_pcm_.store(nullptr);
-                if (capture != nullptr) {
-                    result = snd_pcm_close(capture);
-                    capture = nullptr;
-                }
-                if (result >= 0) {
-                    result = snd_pcm_open(&capture,
-                                          options_.capture_pcm.c_str(),
-                                          SND_PCM_STREAM_CAPTURE, 0);
-                }
-                if (result >= 0) result = configure_pcm(capture);
-                if (result < 0 && capture != nullptr) {
-                    snd_pcm_close(capture);
-                    capture = nullptr;
-                }
-                capture_pcm_.store(capture);
-            }
+            const int result = resumeCapture() ? 0 : -EIO;
             if (result < 0) {
                 cerr << "Cannot reopen capture PCM '"
                      << options_.capture_pcm << "': " << snd_strerror(result)
@@ -219,11 +229,11 @@ bool AudioEngine::apply_request(snd_pcm_t*& capture, Request request,
     return false;
 }
 
-void AudioEngine::run() {
+// Open/configure capture and headphones inside the audio worker.
+bool AudioEngine::initAlsa() {
     using phono::protocol::Error;
-    set_audio_thread_policy();
-    snd_pcm_t* capture = nullptr;
-    snd_pcm_t* playback = nullptr;
+    auto*& capture = capture_handle_;
+    auto*& playback = playback_handle_;
     int err = snd_pcm_open(&capture, options_.capture_pcm.c_str(),
                            SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
@@ -232,15 +242,16 @@ void AudioEngine::run() {
         error_code_.store(static_cast<unsigned>(Error::MicLost));
         post_result(WorkerResultCode::AudioReady, 0,
                     static_cast<uint8_t>(Error::MicLost));
-        return;
+        return false;
     }
     if ((err = configure_pcm(capture)) < 0) {
         cerr << "Cannot configure capture PCM: " << snd_strerror(err) << '\n';
         snd_pcm_close(capture);
+        capture = nullptr;
         error_code_.store(static_cast<unsigned>(Error::MicLost));
         post_result(WorkerResultCode::AudioReady, 0,
                     static_cast<uint8_t>(Error::MicLost));
-        return;
+        return false;
     }
     capture_pcm_.store(capture);
 
@@ -251,29 +262,66 @@ void AudioEngine::run() {
                   << options_.playback_pcm << "': " << snd_strerror(err)
                   << '\n';
         if (playback != nullptr) snd_pcm_close(playback);
+        playback = nullptr;
         capture_pcm_.store(nullptr);
         snd_pcm_close(capture);
+        capture = nullptr;
         error_code_.store(static_cast<unsigned>(Error::OutputError));
         post_result(WorkerResultCode::AudioReady, 0,
                     static_cast<uint8_t>(Error::OutputError));
-        return;
+        return false;
     }
-    if (!dsp_.initialize()) {
-        cerr << "Could not create FFTW plan\n";
-        snd_pcm_close(playback);
-        capture_pcm_.store(nullptr);
-        snd_pcm_close(capture);
-        error_code_.store(static_cast<unsigned>(Error::DspError));
-        post_result(WorkerResultCode::AudioReady, 0,
-                    static_cast<uint8_t>(Error::DspError));
-        return;
+    return true;
+}
+
+int AudioEngine::readFrames(int16_t* buffer, int frames) {
+    return static_cast<int>(snd_pcm_readi(capture_handle_, buffer, frames));
+}
+
+int AudioEngine::writeFrames(const int16_t* buffer, int frames) {
+    return static_cast<int>(snd_pcm_writei(playback_handle_, buffer, frames));
+}
+
+bool AudioEngine::suspendCapture() {
+    return capture_handle_ != nullptr && snd_pcm_drop(capture_handle_) >= 0;
+}
+
+// Reopening capture also recovers a device that was suspended or reconnected.
+bool AudioEngine::resumeCapture() {
+    PthreadLock lock(capture_mutex_);
+    capture_pcm_.store(nullptr);
+    if (capture_handle_ != nullptr) {
+        const int closed = snd_pcm_close(capture_handle_);
+        capture_handle_ = nullptr;
+        if (closed < 0) return false;
     }
+    int result = snd_pcm_open(&capture_handle_, options_.capture_pcm.c_str(),
+                              SND_PCM_STREAM_CAPTURE, 0);
+    if (result >= 0) result = configure_pcm(capture_handle_);
+    if (result < 0 && capture_handle_ != nullptr) {
+        snd_pcm_close(capture_handle_);
+        capture_handle_ = nullptr;
+    }
+    capture_pcm_.store(capture_handle_);
+    return result >= 0;
+}
+
+// Live path: capture -> filter -> gain/clamp -> headphones -> recording -> FFT/telemetry.
+void AudioEngine::run() {
+    using phono::protocol::Error;
+    set_audio_thread_policy();
+    auto*& capture = capture_handle_;
+    auto*& playback = playback_handle_;
+    if (!initAlsa()) return;
     ready_.store(true);
     error_code_.store(0);
     post_result(WorkerResultCode::AudioReady, 0);
 
     array<int16_t, kPeriodFrames> input{};
     array<int16_t, kPeriodFrames> output{};
+    array<float, kPeriodFrames> floating_input{};
+    array<float, kPeriodFrames> filtered{};
+    array<float, kFftBins> magnitudes{};
     bool capture_suspended = false;
     bool playback_active = false;
     bool playback_completion_sent = false;
@@ -281,7 +329,7 @@ void AudioEngine::run() {
     while (!stop_requested_.load() && running.load()) {
         optional<Request> request;
         {
-            lock_guard<mutex> lock(request_mutex_);
+            PthreadLock lock(request_mutex_);
             request = move(request_);
             request_.reset();
         }
@@ -294,7 +342,7 @@ void AudioEngine::run() {
                 playback_operation = request->operation_id;
                 playback_completion_sent = false;
             }
-            apply_request(capture, *request, playback_active);
+            apply_request(*request, playback_active);
         }
 
         snd_pcm_sframes_t count = 0;
@@ -323,12 +371,19 @@ void AudioEngine::run() {
                 }
                 output.fill(0);
                 count = static_cast<snd_pcm_sframes_t>(output.size());
+                if (!playback_completion_sent) {
+                    post_result(WorkerResultCode::PlaybackFinished,
+                                playback_operation,
+                                static_cast<uint8_t>(Error::ReadError));
+                    playback_completion_sent = true;
+                    playback_active = false;
+                }
             }
         } else if (!capture_suspended) {
             while (count < static_cast<snd_pcm_sframes_t>(input.size()) &&
                    !stop_requested_.load() && !capture_suspended) {
-                const auto received = snd_pcm_readi(
-                    capture, input.data() + count, input.size() - count);
+                const auto received = readFrames(input.data() + count,
+                    static_cast<int>(input.size() - count));
                 if (received < 0) {
                     if (!recover_pcm(capture, received)) {
                         error_code_.store(static_cast<unsigned>(Error::MicLost));
@@ -347,23 +402,27 @@ void AudioEngine::run() {
             unsigned mode;
             unsigned gain;
             {
-                lock_guard<mutex> lock(configuration_mutex_);
+                PthreadLock lock(configuration_mutex_);
                 mode = mode_.load();
                 gain = gain_.load();
             }
-            dsp_.process_live(input.data(), output.data(),
-                              static_cast<size_t>(count), mode, gain);
+            for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+                floating_input[i] = static_cast<float>(input[i]);
+            }
+            dsp_.applyBandpass(floating_input.data(), filtered.data(),
+                              static_cast<int>(count), static_cast<FilterMode>(mode));
+            dsp_.applyGainWithLimiter(filtered.data(), output.data(),
+                                     static_cast<int>(count), static_cast<int>(gain));
         } else {
-            this_thread::sleep_for(chrono::milliseconds(1));
+            const timespec pause{0, 1000000L};
+            nanosleep(&pause, nullptr);
             continue;
         }
 
-        const auto telemetry = dsp_.analyze(output.data(),
-                                            static_cast<size_t>(count));
         snd_pcm_sframes_t written = 0;
         while (written < count && !stop_requested_.load()) {
-            const auto result = snd_pcm_writei(
-                playback, output.data() + written, count - written);
+            const auto result = writeFrames(output.data() + written,
+                static_cast<int>(count - written));
             if (result < 0) {
                 if (!recover_pcm(playback, result)) {
                     error_code_.store(static_cast<unsigned>(Error::OutputError));
@@ -377,7 +436,8 @@ void AudioEngine::run() {
         }
 
         if (!playback_active && !capture_suspended && recording_.load() &&
-            !recording_buffer_.push(output.data(), static_cast<size_t>(count))) {
+            !recording_buffer_.push(output.data(), static_cast<size_t>(count)) &&
+            !recording_buffer_.stopped()) {
             recording_.store(false);
             recording_buffer_.stop_producing();
             recording_overruns_.fetch_add(1);
@@ -385,8 +445,13 @@ void AudioEngine::run() {
             post_result(WorkerResultCode::RecordingClosed, 0,
                         static_cast<uint8_t>(Error::RecordOverrun));
         }
-        if (telemetry.has_value() && !telemetry_.try_enqueue(*telemetry)) {
-            dropped_telemetry_.fetch_add(1);
+        // Headphone output and recording come first. FFT is visualization work.
+        dsp_.computeFFT(output.data(), magnitudes.data(), static_cast<int>(count));
+        if (dsp_.fftReady()) {
+            Telemetry telemetry;
+            telemetry.waveform = dsp_.waveform();
+            telemetry.spectrum = magnitudes;
+            if (!telemetry_.try_enqueue(telemetry)) dropped_telemetry_.fetch_add(1);
         }
     }
 
@@ -394,13 +459,15 @@ void AudioEngine::run() {
     recording_.store(false);
     playback_buffer_.stop_producing();
     {
-        lock_guard<mutex> lock(capture_mutex_);
+        PthreadLock lock(capture_mutex_);
         capture_pcm_.store(nullptr);
         if (capture != nullptr) snd_pcm_close(capture);
     }
     if (playback != nullptr) {
         (void)snd_pcm_drain(playback);
         snd_pcm_close(playback);
+        playback = nullptr;
     }
+    capture = nullptr;
 }
 }  // namespace phono_app

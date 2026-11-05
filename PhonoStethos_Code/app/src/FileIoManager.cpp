@@ -1,4 +1,4 @@
-#include "phonostethos/FileIOManager.h"
+#include "phonostethos/FileIoManager.h"
 
 #include "phonostethos/protocol.h"
 
@@ -97,41 +97,67 @@ bool storage_ready(const Options& options) {
     return false;
 }
 
-FileIOManager::FileIOManager(
+FileIoManager::FileIoManager(
     const Options& options, CommandQueue& messages,
     CircularBuffer<int16_t, kCircularBufferSamples>& recording,
     CircularBuffer<int16_t, kCircularBufferSamples>& playback)
     : options_(options),
       messages_(messages),
       recording_(recording),
-      playback_(playback),
-      worker_(&FileIOManager::run, this) {}
+      playback_(playback) {
+    initializeMutex(mailbox_mutex_);
+    initializeCondition(mailbox_ready_);
+}
 
-FileIOManager::~FileIOManager() { stop(); }
+FileIoManager::~FileIoManager() {
+    stop();
+    pthread_cond_destroy(&mailbox_ready_);
+    pthread_mutex_destroy(&mailbox_mutex_);
+}
 
-bool FileIOManager::request(Request request) {
-    {
-        lock_guard<mutex> lock(mailbox_mutex_);
-        if (stopping_ || mailbox_.has_value()) return false;
-        mailbox_ = move(request);
+void* FileIoManager::threadEntry(void* context) {
+    static_cast<FileIoManager*>(context)->run();
+    return nullptr;
+}
+
+bool FileIoManager::start() {
+    if (worker_started_) return true;
+    const int result = pthread_create(&worker_, nullptr, &FileIoManager::threadEntry, this);
+    if (result != 0) {
+        cerr << "Cannot start FileIoManager: " << strerror(result) << '\n';
+        return false;
     }
-    mailbox_ready_.notify_one();
+    worker_started_ = true;
     return true;
 }
 
-void FileIOManager::stop() {
+// Publish one request under the mailbox mutex; file I/O happens after unlocking.
+bool FileIoManager::request(Request request) {
     {
-        lock_guard<mutex> lock(mailbox_mutex_);
+        PthreadLock lock(mailbox_mutex_);
+        if (stopping_ || mailbox_.has_value()) return false;
+        mailbox_ = move(request);
+    }
+    pthread_cond_signal(&mailbox_ready_);
+    return true;
+}
+
+void FileIoManager::stop() {
+    {
+        PthreadLock lock(mailbox_mutex_);
         if (stopping_) return;
         stopping_ = true;
     }
     recording_.stop_producing();
     playback_.stop_producing();
-    mailbox_ready_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    pthread_cond_broadcast(&mailbox_ready_);
+    if (worker_started_) {
+        pthread_join(worker_, nullptr);
+        worker_started_ = false;
+    }
 }
 
-void FileIOManager::set_file_thread_policy() {
+void FileIoManager::set_file_thread_policy() {
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
     CPU_SET(2, &cpus);
@@ -151,7 +177,7 @@ void FileIOManager::set_file_thread_policy() {
     }
 }
 
-void FileIOManager::post_result(WorkerResultCode code, uint32_t operation_id,
+void FileIoManager::post_result(WorkerResultCode code, uint32_t operation_id,
                                 uint8_t error) {
     MainMessage message;
     message.kind = error == 0 ? MessageKind::WorkerResult
@@ -162,11 +188,11 @@ void FileIOManager::post_result(WorkerResultCode code, uint32_t operation_id,
     messages_.enqueue(move(message));
 }
 
-bool FileIOManager::storage_available() const {
+bool FileIoManager::storage_available() const {
     return !storage_removed_ && storage_ready(options_);
 }
 
-void FileIOManager::post_storage_status(WorkerResultCode code,
+void FileIoManager::post_storage_status(WorkerResultCode code,
                                         uint32_t operation_id) {
     MainMessage message;
     message.kind = MessageKind::WorkerResult;
@@ -193,7 +219,9 @@ void FileIOManager::post_storage_status(WorkerResultCode code,
     messages_.enqueue(move(message));
 }
 
-bool FileIOManager::write_recording(SNDFILE* file) {
+// pop() releases its buffer mutex before the potentially slow disk write.
+bool FileIoManager::write_recording() {
+    auto* file = recording_file_;
     if (file == nullptr) return false;
     if (!storage_available()) {
         recording_error_.store(
@@ -204,8 +232,7 @@ bool FileIOManager::write_recording(SNDFILE* file) {
     array<int16_t, kPeriodFrames> samples{};
     const auto count = recording_.pop(samples.data(), samples.size());
     if (count == 0) return true;
-    const auto written = sf_write_short(file, samples.data(),
-                                        static_cast<sf_count_t>(count));
+    const auto written = writeChunk(samples.data(), static_cast<sf_count_t>(count));
     if (written != static_cast<sf_count_t>(count)) {
         const auto error = errno == ENOSPC
                                ? phono::protocol::Error::DiskFull
@@ -218,19 +245,20 @@ bool FileIOManager::write_recording(SNDFILE* file) {
     return true;
 }
 
-void FileIOManager::read_playback(SNDFILE* file, bool& playback_active,
-                                  uint32_t operation_id) {
-    if (file == nullptr || !playback_active) return;
+// Read only what fits: FileIO produces playback; AudioDSP consumes it.
+void FileIoManager::read_playback() {
+    auto* file = playback_file_;
+    const auto operation_id = playback_operation_;
+    if (file == nullptr || !playback_active_) return;
     const auto available = playback_.available_capacity();
     if (available == 0) return;
     array<int16_t, kPeriodFrames> samples{};
     const auto requested = min(available, samples.size());
-    const auto count = sf_read_short(file, samples.data(),
-                                     static_cast<sf_count_t>(requested));
+    const auto count = readChunk(samples.data(), static_cast<sf_count_t>(requested));
     if (count < 0 || sf_error(file) != SF_ERR_NO_ERROR) {
         cerr << "Playback WAV read failed: " << sf_strerror(file) << '\n';
         playback_.stop_producing();
-        playback_active = false;
+        playback_active_ = false;
         post_result(WorkerResultCode::PlaybackFinished, operation_id,
                     static_cast<uint8_t>(
                         phono::protocol::Error::ReadError));
@@ -238,7 +266,7 @@ void FileIOManager::read_playback(SNDFILE* file, bool& playback_active,
     }
     if (count == 0) {
         playback_.stop_producing();
-        playback_active = false;
+        playback_active_ = false;
         return;
     }
     if (!playback_.push(samples.data(), static_cast<size_t>(count))) {
@@ -246,87 +274,171 @@ void FileIOManager::read_playback(SNDFILE* file, bool& playback_active,
     }
 }
 
-void FileIOManager::process_request(
-    const Request& request, SNDFILE*& recording_file, int& recording_fd,
-    SNDFILE*& playback_file, int& playback_fd, bool& recording_active,
-    bool& playback_active, uint32_t& recording_operation,
-    uint32_t& playback_operation) {
+// Called only by th_FileIO: no other thread touches these SNDFILE handles.
+bool FileIoManager::openRecordFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) return false;
+    recording_fd_ = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (recording_fd_ < 0) {
+        last_error_ = static_cast<uint8_t>(errno == ENOSPC ? Error::DiskFull : Error::OpenError);
+        return false;
+    }
+    SF_INFO info{};
+    info.samplerate = kSampleRate;
+    info.channels = 1;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+    recording_file_ = sf_open_fd(recording_fd_, SFM_WRITE, &info, SF_FALSE);
+    if (!recording_file_) {
+        const int open_error = errno;
+        ::close(recording_fd_);
+        recording_fd_ = -1;
+        error_code ignored;
+        filesystem::remove(filename, ignored);
+        last_error_ = static_cast<uint8_t>(open_error == ENOSPC ? Error::DiskFull : Error::OpenError);
+        return false;
+    }
+    recording_active_ = true;
+    recording_error_.store(0);
+    last_error_ = 0;
+    return true;
+}
+
+bool FileIoManager::openPlaybackFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) return false;
+    playback_fd_ = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (playback_fd_ < 0) {
+        last_error_ = static_cast<uint8_t>(Error::ReadError);
+        return false;
+    }
+    SF_INFO info{};
+    playback_file_ = sf_open_fd(playback_fd_, SFM_READ, &info, SF_FALSE);
+    last_error_ = static_cast<uint8_t>(Error::ReadError);
+    if (!playback_file_) { closeFile(); return false; }
+    if (info.channels != 1 || info.samplerate != kSampleRate ||
+        (info.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
+        (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
+        last_error_ = static_cast<uint8_t>(Error::UnsupportedWav);
+        closeFile();
+        return false;
+    }
+    last_error_ = 0;
+    return true;
+}
+
+vector<string> FileIoManager::getFileList() {
+    vector<string> names;
+    last_error_ = static_cast<uint8_t>(phono::protocol::Error::StorageLost);
+    if (!storage_available()) return names;
+    error_code error;
+    for (filesystem::directory_iterator it(options_.storage, error), end;
+         !error && it != end; it.increment(error)) {
+        if (it->path().extension() == ".wav") names.push_back(it->path().filename().string());
+    }
+    if (error) {
+        last_error_ = static_cast<uint8_t>(phono::protocol::Error::ReadError);
+        return {};
+    }
+    sort(names.begin(), names.end());
+    last_error_ = 0;
+    return names;
+}
+
+sf_count_t FileIoManager::writeChunk(const int16_t* data, sf_count_t count) {
+    return recording_file_ ? sf_write_short(recording_file_, data, count) : 0;
+}
+
+sf_count_t FileIoManager::readChunk(int16_t* data, sf_count_t count) {
+    return playback_file_ ? sf_read_short(playback_file_, data, count) : 0;
+}
+
+// The caller drains recording samples first; this method checks WAV finalization.
+bool FileIoManager::closeFile() {
+    using phono::protocol::Error;
+    bool success = true;
+    if (recording_file_) {
+        sf_write_sync(recording_file_);
+        if (sf_error(recording_file_) != SF_ERR_NO_ERROR) {
+            recording_error_.store(static_cast<uint8_t>(Error::WriteError));
+            success = false;
+        }
+        if (sf_close(recording_file_) != 0) {
+            if (recording_error_.load() == 0) recording_error_.store(static_cast<uint8_t>(Error::FinalizeError));
+            success = false;
+        }
+        recording_file_ = nullptr;
+    }
+    if (recording_fd_ >= 0) {
+        if (::close(recording_fd_) != 0) success = false;
+        recording_fd_ = -1;
+    }
+    if (playback_file_) {
+        if (sf_close(playback_file_) != 0) success = false;
+        playback_file_ = nullptr;
+    }
+    if (playback_fd_ >= 0) {
+        if (::close(playback_fd_) != 0) success = false;
+        playback_fd_ = -1;
+    }
+    return success;
+}
+
+bool FileIoManager::deleteRecordFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) return false;
+    // A basename is a name, never a path supplied by the GUI.
+    if (filename.empty() || filename.find_first_of("/\\") != string::npos || filename == "." || filename == "..") {
+        last_error_ = static_cast<uint8_t>(Error::InvalidArgument);
+        return false;
+    }
+    error_code error;
+    if (!filesystem::remove(options_.storage / filename, error) || error) {
+        last_error_ = static_cast<uint8_t>(Error::WriteError);
+        return false;
+    }
+    last_error_ = 0;
+    return true;
+}
+
+bool FileIoManager::ejectStorage() {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::Busy);
+    if (recording_file_ || playback_file_) return false;
+    if (!storage_available()) {
+        last_error_ = static_cast<uint8_t>(Error::StorageLost);
+        return false;
+    }
+    last_error_ = static_cast<uint8_t>(Error::UnmountError);
+    const int fd = ::open(options_.storage.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return false;
+    const bool synced = ::syncfs(fd) == 0;
+    const bool closed = ::close(fd) == 0;
+    if (!synced || !closed || ::umount2(options_.storage.c_str(), 0) != 0) return false;
+    last_error_ = 0;
+    return true;
+}
+
+// Dispatch control independently of recording data: LIST/EJECT also work while idle.
+void FileIoManager::process_request(const Request& request) {
     using phono::protocol::Error;
     switch (request.kind) {
         case RequestKind::OpenRecording: {
-            if (!storage_available() || recording_file != nullptr ||
-                playback_file != nullptr) {
-                post_result(WorkerResultCode::RecordingOpened,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::StorageLost));
-                return;
-            }
-            const int descriptor =
-                ::open(request.path.c_str(),
-                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-            if (descriptor < 0) {
-                const auto error = errno == ENOSPC ? Error::DiskFull
-                                                    : Error::OpenError;
-                post_result(WorkerResultCode::RecordingOpened,
-                            request.operation_id,
-                            static_cast<uint8_t>(error));
-                return;
-            }
-            SF_INFO info{};
-            info.samplerate = kSampleRate;
-            info.channels = 1;
-            info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
-            recording_file = sf_open_fd(descriptor, SFM_WRITE, &info, SF_FALSE);
-            if (recording_file == nullptr) {
-                const int open_error = errno;
-                ::close(descriptor);
-                error_code remove_error;
-                filesystem::remove(request.path, remove_error);
-                post_result(
-                    WorkerResultCode::RecordingOpened, request.operation_id,
-                    static_cast<uint8_t>(open_error == ENOSPC
-                                             ? Error::DiskFull
-                                             : Error::OpenError));
-                return;
-            }
-            recording_fd = descriptor;
-            recording_active = true;
-            recording_error_.store(0);
-            post_result(WorkerResultCode::RecordingOpened,
-                        request.operation_id);
+            const bool opened = openRecordFile(request.path.string());
+            post_result(WorkerResultCode::RecordingOpened, request.operation_id,
+                        opened ? 0 : last_error_);
             return;
         }
         case RequestKind::CloseRecording: {
             bool success = true;
             while (!recording_.isEmpty() && success) {
-                success = write_recording(recording_file);
+                success = write_recording();
             }
             if (!recording_.isEmpty()) recording_.clear();
-            if (recording_file != nullptr) {
-                sf_write_sync(recording_file);
-                if (sf_error(recording_file) != SF_ERR_NO_ERROR) {
-                    success = false;
-                    if (recording_error_.load() == 0) {
-                        recording_error_.store(
-                            static_cast<uint8_t>(Error::WriteError));
-                    }
-                }
-                if (sf_close(recording_file) != 0) {
-                    success = false;
-                    if (recording_error_.load() == 0) {
-                        recording_error_.store(
-                            static_cast<uint8_t>(Error::FinalizeError));
-                    }
-                    cerr << "Cannot finalize recording: "
-                              << sf_strerror(nullptr) << '\n';
-                }
-                recording_file = nullptr;
-            }
-            if (recording_fd >= 0) {
-                if (::close(recording_fd) != 0) success = false;
-                recording_fd = -1;
-            }
-            recording_active = false;
+            if (!closeFile()) success = false;
+            recording_active_ = false;
             const auto final_error =
                 recording_error_.load() != 0
                     ? recording_error_.load()
@@ -334,12 +446,12 @@ void FileIOManager::process_request(
                                : static_cast<uint8_t>(Error::FinalizeError));
             post_result(WorkerResultCode::RecordingClosed,
                         request.operation_id, final_error);
-            recording_operation = 0;
+            recording_operation_ = 0;
             return;
         }
         case RequestKind::PreparePlayback: {
-            if (!storage_available() || recording_file != nullptr ||
-                playback_file != nullptr) {
+            if (!storage_available() || recording_file_ != nullptr ||
+                playback_file_ != nullptr) {
                 post_result(WorkerResultCode::PlaybackReady,
                             request.operation_id,
                             static_cast<uint8_t>(Error::StorageLost));
@@ -354,52 +466,31 @@ void FileIOManager::process_request(
                             static_cast<uint8_t>(Error::StaleFileId));
                 return;
             }
-            const int descriptor =
-                ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (!openPlaybackFile(path.string())) {
+                post_result(WorkerResultCode::PlaybackReady, request.operation_id, last_error_);
+                return;
+            }
             struct stat opened_metadata {};
-            if (descriptor < 0 || ::fstat(descriptor, &opened_metadata) != 0 ||
-                !same_file(request.identity, opened_metadata)) {
-                if (descriptor >= 0) ::close(descriptor);
-                post_result(WorkerResultCode::PlaybackReady,
-                            request.operation_id,
+            if (::fstat(playback_fd_, &opened_metadata) != 0 || !same_file(request.identity, opened_metadata)) {
+                closeFile();
+                post_result(WorkerResultCode::PlaybackReady, request.operation_id,
                             static_cast<uint8_t>(Error::StaleFileId));
                 return;
             }
-            SF_INFO info{};
-            playback_file = sf_open_fd(descriptor, SFM_READ, &info, SF_FALSE);
-            if (playback_file == nullptr) {
-                ::close(descriptor);
-                post_result(WorkerResultCode::PlaybackReady,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::ReadError));
-                return;
-            }
-            if (info.channels != 1 || info.samplerate != kSampleRate ||
-                (info.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
-                (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
-                sf_close(playback_file);
-                playback_file = nullptr;
-                ::close(descriptor);
-                post_result(WorkerResultCode::PlaybackReady,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::UnsupportedWav));
-                return;
-            }
-            playback_fd = descriptor;
             playback_.clear();
             if (!playback_.begin_session()) {
-                sf_close(playback_file);
-                playback_file = nullptr;
-                ::close(playback_fd);
-                playback_fd = -1;
+                sf_close(playback_file_);
+                playback_file_ = nullptr;
+                ::close(playback_fd_);
+                playback_fd_ = -1;
                 post_result(WorkerResultCode::PlaybackReady,
                             request.operation_id,
                             static_cast<uint8_t>(Error::Busy));
                 return;
             }
-            playback_active = true;
-            playback_operation = request.operation_id;
-            read_playback(playback_file, playback_active, playback_operation);
+            playback_active_ = true;
+            playback_operation_ = request.operation_id;
+            read_playback();
             post_result(WorkerResultCode::PlaybackReady,
                         request.operation_id);
             return;
@@ -407,16 +498,8 @@ void FileIOManager::process_request(
         case RequestKind::StopPlayback: {
             playback_.stop_producing();
             playback_.clear();
-            bool success = true;
-            if (playback_file != nullptr) {
-                if (sf_close(playback_file) != 0) success = false;
-                playback_file = nullptr;
-            }
-            if (playback_fd >= 0) {
-                if (::close(playback_fd) != 0) success = false;
-                playback_fd = -1;
-            }
-            playback_active = false;
+            const bool success = closeFile();
+            playback_active_ = false;
             post_result(WorkerResultCode::PlaybackClosed,
                         request.operation_id,
                         success ? 0
@@ -428,90 +511,41 @@ void FileIOManager::process_request(
             message.kind = MessageKind::WorkerResult;
             message.operation_id = request.operation_id;
             message.result_code = WorkerResultCode::ArchiveReady;
-            error_code error;
-            if (!storage_available()) {
+            const auto filenames = getFileList();
+            if (last_error_ != 0) {
                 message.kind = MessageKind::WorkerError;
-                message.error_code = static_cast<uint8_t>(Error::StorageLost);
-                messages_.enqueue(move(message));
-                return;
-            }
-            for (filesystem::directory_iterator it(options_.storage, error), end;
-                 !error && it != end; it.increment(error)) {
-                if (it->path().extension() != ".wav") continue;
-                struct stat file_metadata {};
-                if (::lstat(it->path().c_str(), &file_metadata) != 0 ||
-                    !S_ISREG(file_metadata.st_mode)) {
-                    continue;
-                }
-                message.archive.push_back(
-                    ArchiveIdentity{it->path().filename().string(),
-                                    file_metadata.st_dev, file_metadata.st_ino,
-                                    file_metadata.st_size,
-                                    file_metadata.st_mtim});
-            }
-            if (error) {
-                message.kind = MessageKind::WorkerError;
-                message.error_code = static_cast<uint8_t>(Error::ReadError);
+                message.error_code = last_error_;
             } else {
-                sort(message.archive.begin(), message.archive.end(),
-                     [](const auto& left, const auto& right) {
-                         return left.basename < right.basename;
-                     });
+                for (const auto& filename : filenames) {
+                    struct stat metadata {};
+                    const auto path = options_.storage / filename;
+                    if (::lstat(path.c_str(), &metadata) == 0 && S_ISREG(metadata.st_mode)) {
+                        message.archive.push_back({filename, metadata.st_dev, metadata.st_ino,
+                                                   metadata.st_size, metadata.st_mtim});
+                    }
+                }
             }
             messages_.enqueue(move(message));
             return;
         }
         case RequestKind::Delete: {
-            const auto path = options_.storage / request.identity.basename;
             struct stat metadata {};
-            if (!storage_available() ||
-                ::lstat(path.c_str(), &metadata) != 0 ||
-                !same_file(request.identity, metadata)) {
-                post_result(WorkerResultCode::RecordingDeleted,
-                            request.operation_id,
+            const auto path = options_.storage / request.identity.basename;
+            if (::lstat(path.c_str(), &metadata) != 0 || !same_file(request.identity, metadata)) {
+                post_result(WorkerResultCode::RecordingDeleted, request.operation_id,
                             static_cast<uint8_t>(Error::StaleFileId));
                 return;
             }
-            error_code error;
-            if (!filesystem::remove(path, error) || error) {
-                post_result(WorkerResultCode::RecordingDeleted,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::WriteError));
-                return;
-            }
-            post_result(WorkerResultCode::RecordingDeleted,
-                        request.operation_id);
+            const bool deleted = deleteRecordFile(request.identity.basename);
+            post_result(WorkerResultCode::RecordingDeleted, request.operation_id,
+                        deleted ? 0 : last_error_);
             return;
         }
+
         case RequestKind::Eject: {
-            if (recording_file != nullptr || playback_file != nullptr) {
-                post_result(WorkerResultCode::StorageEjected,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::Busy));
-                return;
-            }
-            if (!storage_available()) {
-                post_result(WorkerResultCode::StorageEjected,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::StorageLost));
-                return;
-            }
-            const int storage_fd =
-                ::open(options_.storage.c_str(), O_RDONLY | O_DIRECTORY);
-            if (storage_fd < 0 || ::syncfs(storage_fd) != 0) {
-                if (storage_fd >= 0) ::close(storage_fd);
-                post_result(WorkerResultCode::StorageEjected,
-                            request.operation_id,
-                            static_cast<uint8_t>(Error::UnmountError));
-                return;
-            }
-            const bool closed = ::close(storage_fd) == 0;
-            const bool unmounted =
-                closed && ::umount2(options_.storage.c_str(), 0) == 0;
-            post_result(WorkerResultCode::StorageEjected,
-                        request.operation_id,
-                        unmounted ? 0
-                                  : static_cast<uint8_t>(Error::UnmountError));
+            const bool ejected = ejectStorage();
+            post_result(WorkerResultCode::StorageEjected, request.operation_id,
+                        ejected ? 0 : last_error_);
             return;
         }
         case RequestKind::Mount:
@@ -576,61 +610,61 @@ void FileIOManager::process_request(
             }
             storage_removed_ = true;
             recording_.stop_producing();
-            const bool had_recording = recording_file != nullptr;
+            const bool had_recording = recording_file_ != nullptr;
             uint8_t close_error = recording_error_.load();
-            if (recording_file != nullptr) {
+            if (recording_file_ != nullptr) {
                 while (!recording_.isEmpty() &&
-                       write_recording(recording_file)) {}
+                       write_recording()) {}
                 if (!recording_.isEmpty()) recording_.clear();
                 if (recording_error_.load() != 0) {
                     close_error = recording_error_.load();
                 }
-                sf_write_sync(recording_file);
-                if (sf_error(recording_file) != SF_ERR_NO_ERROR &&
+                sf_write_sync(recording_file_);
+                if (sf_error(recording_file_) != SF_ERR_NO_ERROR &&
                     close_error == 0) {
                     close_error = static_cast<uint8_t>(Error::WriteError);
                 }
-                if (sf_close(recording_file) != 0 && close_error == 0) {
+                if (sf_close(recording_file_) != 0 && close_error == 0) {
                     close_error = static_cast<uint8_t>(Error::FinalizeError);
                 }
-                recording_file = nullptr;
+                recording_file_ = nullptr;
             }
-            if (recording_fd >= 0) {
-                if (::close(recording_fd) != 0 && close_error == 0) {
+            if (recording_fd_ >= 0) {
+                if (::close(recording_fd_) != 0 && close_error == 0) {
                     close_error = static_cast<uint8_t>(Error::FinalizeError);
                 }
-                recording_fd = -1;
+                recording_fd_ = -1;
             }
-            recording_active = false;
+            recording_active_ = false;
             if (had_recording) {
                 post_result(WorkerResultCode::RecordingClosed,
-                            recording_operation, close_error);
-                recording_operation = 0;
+                            recording_operation_, close_error);
+                recording_operation_ = 0;
             }
             playback_.stop_producing();
             playback_.clear();
-            const bool had_playback = playback_file != nullptr;
+            const bool had_playback = playback_file_ != nullptr;
             uint8_t playback_close_error = 0;
-            if (playback_file != nullptr) {
-                if (sf_close(playback_file) != 0) {
+            if (playback_file_ != nullptr) {
+                if (sf_close(playback_file_) != 0) {
                     playback_close_error =
                         static_cast<uint8_t>(Error::FinalizeError);
                 }
-                playback_file = nullptr;
+                playback_file_ = nullptr;
             }
-            if (playback_fd >= 0) {
-                if (::close(playback_fd) != 0 && playback_close_error == 0) {
+            if (playback_fd_ >= 0) {
+                if (::close(playback_fd_) != 0 && playback_close_error == 0) {
                     playback_close_error =
                         static_cast<uint8_t>(Error::FinalizeError);
                 }
-                playback_fd = -1;
+                playback_fd_ = -1;
             }
-            playback_active = false;
+            playback_active_ = false;
             if (had_playback) {
                 post_result(WorkerResultCode::PlaybackClosed,
-                            playback_operation, playback_close_error);
+                            playback_operation_, playback_close_error);
             }
-            playback_operation = 0;
+            playback_operation_ = 0;
             mounted_device_.clear();
             if (::umount2(options_.storage.c_str(), 0) != 0 && errno != EINVAL &&
                 errno != ENOENT) {
@@ -653,25 +687,23 @@ void FileIOManager::process_request(
     }
 }
 
-void FileIOManager::run() {
+// This pthread owns all WAV handles and filesystem operations.
+void FileIoManager::run() {
     set_file_thread_policy();
-    SNDFILE* recording_file = nullptr;
-    SNDFILE* playback_file = nullptr;
-    int recording_fd = -1;
-    int playback_fd = -1;
-    bool recording_active = false;
-    bool playback_active = false;
-    uint32_t recording_operation = 0;
-    uint32_t playback_operation = 0;
     if (storage_available()) mounted_device_ = mounted_source(options_.storage);
     post_storage_status(WorkerResultCode::FileIOReady, 0);
     while (true) {
         optional<Request> request;
         {
-            unique_lock<mutex> lock(mailbox_mutex_);
-            mailbox_ready_.wait_for(lock, chrono::milliseconds(10), [&] {
-                return stopping_ || mailbox_.has_value();
-            });
+            PthreadLock lock(mailbox_mutex_);
+            const auto deadline = waitDeadline(10);
+            while (!stopping_ && !mailbox_.has_value() &&
+                   !recording_active_ && (!playback_active_ || playback_.isFull())) {
+                const int result = pthread_cond_timedwait(
+                    &mailbox_ready_, &mailbox_mutex_, &deadline);
+                if (result == ETIMEDOUT) break;
+                checkPthread(result);
+            }
             if (mailbox_.has_value()) {
                 request = move(mailbox_);
                 mailbox_.reset();
@@ -681,45 +713,47 @@ void FileIOManager::run() {
         }
         if (request.has_value()) {
             if (request->kind == RequestKind::OpenRecording) {
-                recording_operation = request->operation_id;
+                recording_operation_ = request->operation_id;
             }
-            process_request(*request, recording_file, recording_fd,
-                            playback_file, playback_fd, recording_active,
-                            playback_active, recording_operation,
-                            playback_operation);
+            process_request(*request);
         }
 
-        if (recording_active && recording_file != nullptr) {
+        if (recording_active_ && recording_file_ != nullptr) {
             if (!storage_available()) {
                 recording_.stop_producing();
                 recording_.clear();
-                sf_close(recording_file);
-                recording_file = nullptr;
-                if (recording_fd >= 0) ::close(recording_fd);
-                recording_fd = -1;
-                recording_active = false;
+                sf_close(recording_file_);
+                recording_file_ = nullptr;
+                if (recording_fd_ >= 0) ::close(recording_fd_);
+                recording_fd_ = -1;
+                recording_active_ = false;
                 recording_error_.store(
                     static_cast<uint8_t>(phono::protocol::Error::StorageLost));
                 post_result(WorkerResultCode::RecordingClosed,
-                            recording_operation,
+                            recording_operation_,
                             static_cast<uint8_t>(
                                 phono::protocol::Error::StorageLost));
             } else {
-                (void)write_recording(recording_file);
+                if (!write_recording()) {
+                    Request close_request;
+                    close_request.kind = RequestKind::CloseRecording;
+                    close_request.operation_id = recording_operation_;
+                    process_request(close_request);
+                }
             }
         }
-        if (playback_active) {
-            read_playback(playback_file, playback_active, playback_operation);
+        if (playback_active_) {
+            read_playback();
         }
     }
-    if (recording_file != nullptr) {
+    if (recording_file_ != nullptr) {
         while (!recording_.isEmpty() &&
-               write_recording(recording_file)) {}
-        sf_write_sync(recording_file);
-        sf_close(recording_file);
+               write_recording()) {}
+        sf_write_sync(recording_file_);
+        sf_close(recording_file_);
     }
-    if (recording_fd >= 0) ::close(recording_fd);
-    if (playback_file != nullptr) sf_close(playback_file);
-    if (playback_fd >= 0) ::close(playback_fd);
+    if (recording_fd_ >= 0) ::close(recording_fd_);
+    if (playback_file_ != nullptr) sf_close(playback_file_);
+    if (playback_fd_ >= 0) ::close(playback_fd_);
 }
 }  // namespace phono_app

@@ -9,13 +9,15 @@ class LedDriver {
 public:
     explicit LedDriver(const string& path);
 
-    bool open();
+    bool openDriver();
 
-    bool write(uint8_t command);
+    bool writeByte(uint8_t command);
 
-    bool set_mode(FilterMode mode, bool recording);
+    bool setModeLed(FilterMode mode);
+    bool setRecordLed(bool recording);
+    bool triggerErrorPulse();
 
-    void close();
+    void closeDriver();
 
     ~LedDriver();
 
@@ -23,5 +25,6 @@ private:
     string path_;
     int fd_ = -1;
     bool available_ = false;
+    uint8_t cached_mask_ = 0;
 };
 }  // namespace phono_app

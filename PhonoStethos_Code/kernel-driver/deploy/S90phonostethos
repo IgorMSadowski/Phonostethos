@@ -14,7 +14,7 @@ case "$1" in
         if ! grep -q '^phonostethos_leds ' /proc/modules; then
             if [ ! -f "$MODULE" ] || ! insmod "$MODULE"; then
                 echo "Could not load the PhonoStethos LED driver from $MODULE" >&2
-                exit 1
+                echo "Continuing without LED indicators" >&2
             fi
         fi
         if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then

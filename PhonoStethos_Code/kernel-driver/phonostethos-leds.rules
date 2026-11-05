@@ -1,1 +1,1 @@
-SUBSYSTEM=="phonostethos", KERNEL=="phonostethos_leds", MODE="0660", GROUP="audio"
+SUBSYSTEM=="phonostethos", KERNEL=="phonostethos_leds", MODE="0660", GROUP="phonostethos"

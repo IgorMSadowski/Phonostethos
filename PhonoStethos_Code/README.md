@@ -1,5 +1,8 @@
 # PhonoStethos
 
+Start with [How the code works](docs/CODE_GUIDE.md). Build/boot changes are in
+[Deployment](docs/DEPLOYMENT.md).
+
 The source tree separates the Raspberry Pi kernel driver, C++ application, and
 Flutter host client:
 
@@ -27,7 +30,7 @@ names. The `plughw` devices let ALSA adapt the hardware format to the server's
 mono 8 kHz stream.
 
 Install the ALSA, FFTW3f, and libsndfile development packages, then build and
-test the protocol and queue utilities:
+test the protocol, pthread synchronization, DSP and file utilities:
 
 ```sh
 cmake -S app -B app/build
@@ -41,11 +44,11 @@ the configured Buildroot toolchain and kernel tree.
 ## Kernel driver
 
 The driver source is `kernel-driver/phonostethos_leds.c`. It creates
-`/dev/phonostethos_leds` when the module loads and directly controls the
-Raspberry Pi 4 BCM2711 GPIO registers. It does not depend on a device-tree
-overlay. The LED mask is HEART `0x01` / BCM17, LUNG `0x02` / BCM27, GENERAL
-`0x04` / BCM24, and recording `0x08` / BCM22. This driver is specific to the
-Pi 4 BCM2711 GPIO register mapping.
+`/dev/phonostethos_leds` after probing the `phonostethos,status-leds` Device Tree
+node. It uses the kernel GPIO descriptor (`gpiod`) interface. The LED mask is
+HEART `0x01` / BCM17, LUNG `0x02` / BCM27, GENERAL `0x04` / BCM24, and recording
+`0x08` / BCM22. Enable `dtoverlay=phonostethos-status-leds` in the target firmware
+configuration; the overlay is required by this driver.
 
 Build it against the exact target kernel headers with:
 
@@ -54,10 +57,10 @@ make -C kernel-driver KDIR=/path/to/linux \
   CROSS_COMPILE=/path/to/toolchain/bin/aarch64-linux- ARCH=arm64
 ```
 
-The root `Makefile` stages the kernel module, udev permissions, and init
-script. Loading the module creates the character device; the overlay file
-`kernel-driver/phonostethos-status-leds-overlay.dts` is not needed by this
-driver.
+The root `Makefile` stages the kernel module, GPIO overlay, udev permissions and
+init script. The udev rule uses the `phonostethos` group; the Buildroot users-table
+input is supplied in `kernel-driver/deploy/users.txt`. See the deployment guide
+for the firmware config line and exact staging paths.
 
 The server stores recordings on the drive mounted at `/media/usb_storage`.
 The Buildroot overlay installs an eudev rule to mount USB FAT32

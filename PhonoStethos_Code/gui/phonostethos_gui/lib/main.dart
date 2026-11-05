@@ -180,6 +180,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
+  // The GUI sends a request. The Pi validates it and returns CommandResult/State.
+  // One pending command prevents conflicting button presses while workers finish.
   void _request(Command command, int value) {
     if (!_connected || _pendingCommand != null) return;
     final socket = _socket;
@@ -203,6 +205,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _request(Command.getArchive, 0);
   }
 
+  // This disconnects the dashboard only; it does not stop the Pi's recording.
   void _connectionEnded(String reason) {
     if (!_connected && _reconnectTimer != null) return;
     _connected = false;

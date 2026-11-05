@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <cstring>
 
 using namespace std;
@@ -21,30 +22,43 @@ SystemController::SystemController(const Options& options)
     : options_(options),
       led_driver_(options.led_device),
       writer_(options, command_queue_, recording_buffer_, playback_buffer_),
-      network_(options, command_queue_, data_queue_, control_output_) {}
+      network_(options, command_queue_, data_queue_) {
+    initializeMutex(configuration_mutex_);
+}
 
-SystemController::~SystemController() { stop(); }
+SystemController::~SystemController() {
+    stop();
+    pthread_mutex_destroy(&configuration_mutex_);
+}
 
+// Prepare shared resources first; only then create the three worker pthreads.
 bool SystemController::initSystem() {
     if (initialized_) return true;
     set_main_thread_policy();
-    if (!init_udev_monitor()) return false;
-    if (!led_driver_.open()) {
+    if (!initUdevMonitor()) return false;
+    if (!led_driver_.openDriver()) {
         led_error_.store(true);
         cerr << "LED status outputs are unavailable; continuing without LEDs\n";
     }
     update_leds();
+    // FFTW planning belongs to startup: no worker may execute an unfinished plan.
+    if (!dsp_processor_.initialize()) {
+        cerr << "Cannot prepare the FFTW plan\n";
+        set_error(static_cast<uint8_t>(phono::protocol::Error::DspError));
+        return false;
+    }
     audio_ = make_unique<AudioEngine>(
-        options_, mode_, gain_, recording_, error_code_, command_queue_,
+        options_, dsp_processor_, mode_, gain_, recording_, error_code_, command_queue_,
         data_queue_, configuration_mutex_, recording_buffer_, playback_buffer_,
         dropped_telemetry_, recording_overruns_);
+    if (!audio_->start() || !writer_.start()) return false;
 
     const auto deadline = chrono::steady_clock::now() + chrono::seconds(5);
     while (!audio_init_complete_.load() &&
            chrono::steady_clock::now() < deadline) {
         MainMessage message;
         if (command_queue_.dequeue(message, chrono::milliseconds(10))) {
-            process_message(message);
+            processMessage(message);
         }
     }
     if (!audio_ready_.load()) {
@@ -57,21 +71,22 @@ bool SystemController::initSystem() {
     return true;
 }
 
+// Main coordinates operations. The queue lock is released before any handler runs.
 void SystemController::run() {
     if (!initialized_ && !initSystem()) return;
     while (running.load() && !stopping_) {
         MainMessage message;
         if (command_queue_.dequeue(message, chrono::milliseconds(10))) {
-            process_message(message);
+            processMessage(message);
         }
-        check_usb_events();
+        checkUsbEvents();
         dispatch_deferred_operation_request();
         dispatch_deferred_mount();
         const auto now = chrono::steady_clock::now();
         if (now >= next_storage_check_ && !deferred_storage_request_ &&
             !pending_.has_value()) {
-            FileIOManager::Request request;
-            request.kind = FileIOManager::RequestKind::RefreshStorage;
+            FileIoManager::Request request;
+            request.kind = FileIoManager::RequestKind::RefreshStorage;
             writer_.request(move(request));
             next_storage_check_ = now + chrono::milliseconds(250);
         }
@@ -79,6 +94,7 @@ void SystemController::run() {
     stop();
 }
 
+// Developer/service stop: wake workers and join them before shared objects are destroyed.
 void SystemController::stop() {
     if (stopping_) return;
     stopping_ = true;
@@ -97,7 +113,7 @@ void SystemController::stop() {
         udev_context_ = nullptr;
     }
     udev_fd_ = -1;
-    led_driver_.close();
+    led_driver_.closeDriver();
     command_queue_.close();
 }
 
@@ -109,13 +125,13 @@ uint32_t SystemController::begin_operation(
     return operation_id;
 }
 
-bool SystemController::request_file(FileIOManager::Request request) {
+bool SystemController::request_file(FileIoManager::Request request) {
     if (writer_.request(move(request))) return true;
     cerr << "FileIO request rejected because its mailbox is occupied\n";
     return false;
 }
 
-bool SystemController::queue_file_request(FileIOManager::Request request) {
+bool SystemController::queue_file_request(FileIoManager::Request request) {
     if (writer_.request(request)) return true;
     if (deferred_operation_request_) {
         cerr << "A deferred FileIO operation is already pending\n";
@@ -131,18 +147,20 @@ bool SystemController::request_audio(AudioEngine::Request request) {
     return false;
 }
 
-void SystemController::process_message(const MainMessage& message) {
+// The same queue carries GUI commands and worker replies; kind tells them apart.
+void SystemController::processMessage(const MainMessage& message) {
     if (message.kind == MessageKind::GuiCommand) {
-        process_command(message.command);
+        processCommand(message.command);
         return;
     }
     if (message.kind == MessageKind::WorkerError) {
         set_error(message.error_code);
     }
-    handle_worker_result(message);
+    handleWorkerResult(message);
 }
 
-void SystemController::process_command(
+// Reject invalid/conflicting requests before calling the named diagram operation.
+void SystemController::processCommand(
     const phono::protocol::CommandPacket& request) {
     using namespace phono::protocol;
     const auto command = request.type;
@@ -157,262 +175,301 @@ void SystemController::process_command(
         return;
     }
 
+    current_command_ = request;
     switch (command) {
-        case Command::SetMode:
-            {
-                lock_guard<mutex> lock(configuration_mutex_);
-                mode_.store(request.value);
-            }
-            update_leds();
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::Completed, 0);
-            return;
-        case Command::SetGain:
-            {
-                lock_guard<mutex> lock(configuration_mutex_);
-                gain_.store(request.value);
-            }
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::Completed, 0);
-            return;
-        case Command::StartRecording: {
-            const auto required =
-                StorageMounted | StorageWritable | StorageSpaceOk;
-            if (!audio_ready_.load()) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::MicLost));
-                return;
-            }
-            if (transport_.load() != Transport::Live) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            if ((storage_flags_ & required) != required) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::StorageLost));
-                return;
-            }
-            const auto mode =
-                static_cast<FilterMode>(mode_.load());
-            const auto path = options_.storage / generate_filename(mode);
-            const auto session_id = next_session_id_ - 1;
-            const auto operation_id =
-                begin_operation(OperationKind::StartRecording, command,
-                                session_id);
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::OpenRecording;
-            file_request.operation_id = operation_id;
-            file_request.path = path;
-            if (!request_file(move(file_request))) {
-                pending_.reset();
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::StopRecording: {
-            if (transport_.load() != Transport::Recording) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            const auto operation_id =
-                begin_operation(OperationKind::StopRecording, command, 0);
-            transport_.store(Transport::Stopping);
-            recording_.store(false);
-            recording_buffer_.stop_producing();
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::CloseRecording;
-            file_request.operation_id = operation_id;
-            if (!queue_file_request(move(file_request))) {
-                set_error(static_cast<uint8_t>(Error::Busy));
-                complete_operation(false, static_cast<uint8_t>(Error::Busy));
-                return;
-            }
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::PlayAudio: {
-            const auto found = archive_by_id_.find(request.value);
-            if (found == archive_by_id_.end()) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::StaleFileId));
-                return;
-            }
-            const auto required =
-                StorageMounted | StorageReadable | StorageSpaceOk;
-            if (!audio_ready_.load() || transport_.load() != Transport::Live ||
-                (storage_flags_ & required) != required || error_code_.load() != 0) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::StorageLost));
-                return;
-            }
-            const auto operation_id =
-                begin_operation(OperationKind::StartPlayback, command,
-                                request.value);
-            transport_.store(Transport::Stopping);
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::PreparePlayback;
-            file_request.operation_id = operation_id;
-            file_request.identity = found->second;
-            if (!request_file(move(file_request))) {
-                transport_.store(Transport::Live);
-                pending_.reset();
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            if (!request_audio({AudioEngine::RequestKind::SuspendCapture,
-                                operation_id})) {
-                fail_start_playback(static_cast<uint8_t>(Error::Busy));
-                publish_command_result(command, Result::AcceptedPending, 0);
-                return;
-            }
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::StopPlayback: {
-            if (transport_.load() != Transport::Playback) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            const auto operation_id =
-                begin_operation(OperationKind::StopPlayback, command, 0);
-            transport_.store(Transport::Stopping);
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::StopPlayback;
-            file_request.operation_id = operation_id;
-            if (!queue_file_request(move(file_request))) {
-                transport_.store(Transport::Playback);
-                pending_.reset();
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            if (!request_audio({AudioEngine::RequestKind::StopPlayback,
-                                operation_id})) {
-                pending_->error_code = static_cast<uint8_t>(Error::Busy);
-            }
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::EjectStorage: {
-            const auto previous_transport = transport_.load();
-            const auto operation_id =
-                begin_operation(OperationKind::EjectStorage, command, 0);
-            pending_->argument = static_cast<uint32_t>(previous_transport);
-            transport_.store(Transport::Ejecting);
-            if (previous_transport == Transport::Recording) {
-                recording_.store(false);
-                recording_buffer_.stop_producing();
-                FileIOManager::Request file_request;
-                file_request.kind = FileIOManager::RequestKind::CloseRecording;
-                file_request.operation_id = operation_id;
-                if (!queue_file_request(move(file_request))) {
-                    transport_.store(Transport::Recording);
-                    pending_.reset();
-                    publish_command_result(command, Result::Rejected,
-                                           static_cast<uint32_t>(Error::Busy));
-                    return;
-                }
-            } else if (previous_transport == Transport::Playback) {
-                pending_->file_done = false;
-                pending_->audio_done = false;
-                FileIOManager::Request file_request;
-                file_request.kind = FileIOManager::RequestKind::StopPlayback;
-                file_request.operation_id = operation_id;
-                if (!queue_file_request(move(file_request))) {
-                    transport_.store(Transport::Playback);
-                    pending_.reset();
-                    publish_command_result(command, Result::Rejected,
-                                           static_cast<uint32_t>(Error::Busy));
-                    return;
-                }
-                const bool audio_requested = request_audio(
-                    {AudioEngine::RequestKind::StopPlayback, operation_id});
-                if (!audio_requested) {
-                    pending_->error_code = static_cast<uint8_t>(Error::Busy);
-                }
-                pending_->commit_requested = false;
-            } else {
-                pending_->phase = 2;
-                FileIOManager::Request file_request;
-                file_request.kind = FileIOManager::RequestKind::Eject;
-                file_request.operation_id = operation_id;
-                if (!queue_file_request(move(file_request))) {
-                    transport_.store(Transport::Live);
-                    complete_operation(false,
-                                       static_cast<uint8_t>(Error::Busy));
-                    return;
-                }
-            }
-            publish_status();
-            publish_state();
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::GetArchive: {
-            const auto operation_id =
-                begin_operation(OperationKind::ListArchive, command,
-                                request.value);
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::List;
-            file_request.operation_id = operation_id;
-            if (!request_file(move(file_request))) {
-                pending_.reset();
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
-        case Command::DeleteRecording: {
-            const auto found = archive_by_id_.find(request.value);
-            if (found == archive_by_id_.end()) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::StaleFileId));
-                return;
-            }
-            if (transport_.load() != Transport::Live ||
-                (storage_flags_ & (StorageMounted | StorageWritable)) !=
-                    (StorageMounted | StorageWritable)) {
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::StorageLost));
-                return;
-            }
-            const auto operation_id =
-                begin_operation(OperationKind::DeleteRecording, command,
-                                request.value);
-            FileIOManager::Request file_request;
-            file_request.kind = FileIOManager::RequestKind::Delete;
-            file_request.operation_id = operation_id;
-            file_request.identity = found->second;
-            if (!request_file(move(file_request))) {
-                pending_.reset();
-                publish_command_result(command, Result::Rejected,
-                                       static_cast<uint32_t>(Error::Busy));
-                return;
-            }
-            publish_command_result(command, Result::AcceptedPending, 0);
-            return;
-        }
+        case Command::SetMode: setMode(static_cast<FilterMode>(request.value)); return;
+        case Command::SetGain: setGain(static_cast<int>(request.value)); return;
+        case Command::StartRecording: startRecording(); return;
+        case Command::StopRecording: stopRecording(); return;
+        case Command::PlayAudio: startPlayback(); return;
+        case Command::StopPlayback: stopPlayback(); return;
+        case Command::EjectStorage: ejectStorage(); return;
+        case Command::GetArchive: listFiles(); return;
+        case Command::DeleteRecording: deleteRecording(request.value); return;
     }
 }
 
-void SystemController::handle_worker_result(const MainMessage& message) {
+void SystemController::setMode(FilterMode mode) {
+    using namespace phono::protocol;
+    const auto command = Command::SetMode;
+    {
+        PthreadLock lock(configuration_mutex_);
+        mode_.store(static_cast<unsigned>(mode));
+    }
+    update_leds();
+    broadcastStatus();
+    publish_command_result(command, Result::Completed, 0);
+}
+
+void SystemController::setGain(int gain) {
+    using namespace phono::protocol;
+    const auto command = Command::SetGain;
+    {
+        PthreadLock lock(configuration_mutex_);
+        gain_.store(static_cast<unsigned>(gain));
+    }
+    broadcastStatus();
+    publish_command_result(command, Result::Completed, 0);
+}
+
+// Ask FileIO to open the WAV. Recording starts only after RecordingOpened arrives.
+void SystemController::startRecording() {
+    using namespace phono::protocol;
+    const auto command = Command::StartRecording;
+    const auto required =
+        StorageMounted | StorageWritable | StorageSpaceOk;
+    if (!audio_ready_.load()) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::MicLost));
+        return;
+    }
+    if (transport_.load() != Transport::Live) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    if ((storage_flags_ & required) != required) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::StorageLost));
+        return;
+    }
+    const auto mode =
+        static_cast<FilterMode>(mode_.load());
+    const auto path = options_.storage / generateFilename(mode);
+    const auto session_id = next_session_id_ - 1;
+    const auto operation_id =
+        begin_operation(OperationKind::StartRecording, command,
+                        session_id);
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::OpenRecording;
+    file_request.operation_id = operation_id;
+    file_request.path = path;
+    if (!request_file(move(file_request))) {
+        pending_.reset();
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+// Close the producer gate now. FileIO drains accepted samples and closes the WAV later.
+void SystemController::stopRecording() {
+    using namespace phono::protocol;
+    const auto command = Command::StopRecording;
+    if (transport_.load() != Transport::Recording) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    const auto operation_id =
+        begin_operation(OperationKind::StopRecording, command, 0);
+    transport_.store(Transport::Stopping);
+    recording_.store(false);
+    recording_buffer_.stop_producing();
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::CloseRecording;
+    file_request.operation_id = operation_id;
+    if (!queue_file_request(move(file_request))) {
+        set_error(static_cast<uint8_t>(Error::Busy));
+        complete_operation(false, static_cast<uint8_t>(Error::Busy));
+        return;
+    }
+    broadcastStatus();
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+// Prepare the file and suspend microphone capture; both workers must be ready.
+void SystemController::startPlayback() {
+    const auto file_id = current_command_.value;
+    using namespace phono::protocol;
+    const auto command = Command::PlayAudio;
+    const auto found = archive_by_id_.find(file_id);
+    if (found == archive_by_id_.end()) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::StaleFileId));
+        return;
+    }
+    const auto required =
+        StorageMounted | StorageReadable | StorageSpaceOk;
+    if (!audio_ready_.load() || transport_.load() != Transport::Live ||
+        (storage_flags_ & required) != required || error_code_.load() != 0) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::StorageLost));
+        return;
+    }
+    const auto operation_id =
+        begin_operation(OperationKind::StartPlayback, command,
+                        file_id);
+    transport_.store(Transport::Stopping);
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::PreparePlayback;
+    file_request.operation_id = operation_id;
+    file_request.identity = found->second;
+    if (!request_file(move(file_request))) {
+        transport_.store(Transport::Live);
+        pending_.reset();
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    if (!request_audio({AudioEngine::RequestKind::SuspendCapture,
+                        operation_id})) {
+        fail_start_playback(static_cast<uint8_t>(Error::Busy));
+        publish_command_result(command, Result::AcceptedPending, 0);
+        return;
+    }
+    broadcastStatus();
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+// Request both worker transitions; LIVE is published only after their acknowledgements.
+void SystemController::stopPlayback() {
+    using namespace phono::protocol;
+    const auto command = Command::StopPlayback;
+    if (transport_.load() != Transport::Playback) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    const auto operation_id =
+        begin_operation(OperationKind::StopPlayback, command, 0);
+    transport_.store(Transport::Stopping);
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::StopPlayback;
+    file_request.operation_id = operation_id;
+    if (!queue_file_request(move(file_request))) {
+        transport_.store(Transport::Playback);
+        pending_.reset();
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    if (!request_audio({AudioEngine::RequestKind::StopPlayback,
+                        operation_id})) {
+        pending_->error_code = static_cast<uint8_t>(Error::Busy);
+    }
+    broadcastStatus();
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+// Finish active storage work before FileIO checks syncfs() and unmount.
+void SystemController::ejectStorage() {
+    using namespace phono::protocol;
+    const auto command = Command::EjectStorage;
+    const auto previous_transport = transport_.load();
+    const auto operation_id =
+        begin_operation(OperationKind::EjectStorage, command, 0);
+    pending_->argument = static_cast<uint32_t>(previous_transport);
+    transport_.store(Transport::Ejecting);
+    if (previous_transport == Transport::Recording) {
+        recording_.store(false);
+        recording_buffer_.stop_producing();
+        FileIoManager::Request file_request;
+        file_request.kind = FileIoManager::RequestKind::CloseRecording;
+        file_request.operation_id = operation_id;
+        if (!queue_file_request(move(file_request))) {
+            transport_.store(Transport::Recording);
+            pending_.reset();
+            publish_command_result(command, Result::Rejected,
+                                   static_cast<uint32_t>(Error::Busy));
+            return;
+        }
+    } else if (previous_transport == Transport::Playback) {
+        pending_->file_done = false;
+        pending_->audio_done = false;
+        FileIoManager::Request file_request;
+        file_request.kind = FileIoManager::RequestKind::StopPlayback;
+        file_request.operation_id = operation_id;
+        if (!queue_file_request(move(file_request))) {
+            transport_.store(Transport::Playback);
+            pending_.reset();
+            publish_command_result(command, Result::Rejected,
+                                   static_cast<uint32_t>(Error::Busy));
+            return;
+        }
+        const bool audio_requested = request_audio(
+            {AudioEngine::RequestKind::StopPlayback, operation_id});
+        if (!audio_requested) {
+            pending_->error_code = static_cast<uint8_t>(Error::Busy);
+        }
+        pending_->commit_requested = false;
+    } else {
+        pending_->stage = WorkflowStage::EjectingStorage;
+        FileIoManager::Request file_request;
+        file_request.kind = FileIoManager::RequestKind::Eject;
+        file_request.operation_id = operation_id;
+        if (!queue_file_request(move(file_request))) {
+            transport_.store(Transport::Live);
+            complete_operation(false,
+                               static_cast<uint8_t>(Error::Busy));
+            return;
+        }
+    }
+    broadcastStatus();
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+void SystemController::listFiles() {
+    const auto cursor = current_command_.value;
+    using namespace phono::protocol;
+    const auto command = Command::GetArchive;
+    const auto operation_id =
+        begin_operation(OperationKind::ListArchive, command,
+                        cursor);
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::List;
+    file_request.operation_id = operation_id;
+    if (!request_file(move(file_request))) {
+        pending_.reset();
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+void SystemController::deleteRecording(uint32_t file_id) {
+    using namespace phono::protocol;
+    const auto command = Command::DeleteRecording;
+    const auto found = archive_by_id_.find(file_id);
+    if (found == archive_by_id_.end()) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::StaleFileId));
+        return;
+    }
+    if (transport_.load() != Transport::Live ||
+        (storage_flags_ & (StorageMounted | StorageWritable)) !=
+            (StorageMounted | StorageWritable)) {
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::StorageLost));
+        return;
+    }
+    const auto operation_id =
+        begin_operation(OperationKind::DeleteRecording, command,
+                        file_id);
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::Delete;
+    file_request.operation_id = operation_id;
+    file_request.identity = found->second;
+    if (!request_file(move(file_request))) {
+        pending_.reset();
+        publish_command_result(command, Result::Rejected,
+                               static_cast<uint32_t>(Error::Busy));
+        return;
+    }
+    publish_command_result(command, Result::AcceptedPending, 0);
+    return;
+}
+
+// Each result advances one pending transition. operation_id rejects replies from older work.
+void SystemController::handleWorkerResult(const MainMessage& message) {
     using namespace phono::protocol;
     if (message.result_code == WorkerResultCode::NetworkFailed) {
         if (message.error_code != 0) set_error(message.error_code);
@@ -427,8 +484,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
         archive_id_by_name_.clear();
         archive_entries_.clear();
         next_file_id_ = 1;
-        publish_status();
-        publish_state();
+        broadcastStatus();
         return;
     }
     if (message.result_code == WorkerResultCode::ClientDisconnected) {
@@ -444,8 +500,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
         if (message.error_code != 0) {
             transport_.store(phono::protocol::Transport::Error);
         }
-        publish_status();
-        publish_state();
+        broadcastStatus();
         return;
     }
     if (message.result_code == WorkerResultCode::FileIOReady ||
@@ -469,8 +524,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
         }
         if (changed || message.result_code == WorkerResultCode::FileIOReady ||
             message.kind == MessageKind::WorkerError || recovered) {
-            publish_status();
-            publish_state();
+            broadcastStatus();
         }
         return;
     }
@@ -485,16 +539,15 @@ void SystemController::handle_worker_result(const MainMessage& message) {
         recording_.store(false);
         active_session_.store(0);
         if (message.operation_id == 0) {
-            FileIOManager::Request close_request;
-            close_request.kind = FileIOManager::RequestKind::CloseRecording;
+            FileIoManager::Request close_request;
+            close_request.kind = FileIoManager::RequestKind::CloseRecording;
             request_file(move(close_request));
         }
         transport_.store(message.error_code == 0 ? Transport::Live
                                                   : Transport::Error);
         update_leds();
         if (message.error_code != 0) set_error(message.error_code);
-        publish_status();
-        publish_state();
+        broadcastStatus();
         return;
     }
     const bool playback_completion_matches_pending =
@@ -565,16 +618,16 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 complete_operation(false, message.error_code);
                 return;
             }
-            if (pending_->phase == 0 && pending_->file_done &&
+            if (pending_->stage == WorkflowStage::WaitingForWorkers && pending_->file_done &&
                 pending_->audio_done) {
-                pending_->phase = 1;
+                pending_->stage = WorkflowStage::ResumingCapture;
                 if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                     pending_->operation_id})) {
                     transport_.store(Transport::Error);
                     complete_operation(false,
                                        static_cast<uint8_t>(Error::Busy));
                 }
-            } else if (pending_->phase == 1 && pending_->file_done &&
+            } else if (pending_->stage == WorkflowStage::ResumingCapture && pending_->file_done &&
                        pending_->audio_done) {
                 transport_.store(Transport::Live);
                 complete_operation(false, pending_->error_code);
@@ -582,7 +635,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             return;
         }
         if (pending_->kind == OperationKind::StopPlayback) {
-            if (pending_->phase == 1) {
+            if (pending_->stage == WorkflowStage::ResumingCapture) {
                 if (message.result_code == WorkerResultCode::PlaybackClosed) {
                     pending_->file_done = true;
                 } else if (message.result_code ==
@@ -608,7 +661,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 return;
             }
             if (pending_->file_done && pending_->audio_done) {
-                pending_->phase = 1;
+                pending_->stage = WorkflowStage::ResumingCapture;
                 pending_->commit_requested = true;
                 if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                     pending_->operation_id})) {
@@ -626,8 +679,8 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             if (pending_->kind != OperationKind::StartRecording) return;
             if (!recording_buffer_.begin_session()) {
                 pending_->error_code = static_cast<uint8_t>(Error::Busy);
-                FileIOManager::Request close_request;
-                close_request.kind = FileIOManager::RequestKind::CloseRecording;
+                FileIoManager::Request close_request;
+                close_request.kind = FileIoManager::RequestKind::CloseRecording;
                 close_request.operation_id = pending_->operation_id;
                 if (!request_file(move(close_request))) {
                     transport_.store(Transport::Error);
@@ -661,10 +714,10 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 }
                 recording_.store(false);
                 active_session_.store(0);
-                FileIOManager::Request eject_request;
-                eject_request.kind = FileIOManager::RequestKind::Eject;
+                FileIoManager::Request eject_request;
+                eject_request.kind = FileIoManager::RequestKind::Eject;
                 eject_request.operation_id = pending_->operation_id;
-                pending_->phase = 2;
+                pending_->stage = WorkflowStage::EjectingStorage;
                 if (!request_file(move(eject_request))) {
                     transport_.store(Transport::Live);
                     complete_operation(false, static_cast<uint8_t>(Error::Busy));
@@ -720,10 +773,10 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 return;
             }
             if (pending_->kind == OperationKind::EjectStorage) {
-                if (pending_->phase != 0) return;
+                if (pending_->stage != WorkflowStage::WaitingForWorkers) return;
                 pending_->file_done = true;
                 if (pending_->audio_done) {
-                    pending_->phase = 1;
+                    pending_->stage = WorkflowStage::ResumingCapture;
                     if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                         pending_->operation_id})) {
                         transport_.store(Transport::Live);
@@ -735,7 +788,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             }
             if (pending_->kind != OperationKind::StopPlayback) return;
             pending_->file_done = true;
-            if (pending_->phase == 1) {
+            if (pending_->stage == WorkflowStage::ResumingCapture) {
                 if (pending_->audio_done) {
                     transport_.store(pending_->error_code == 0
                                          ? Transport::Live
@@ -747,7 +800,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             }
             if (pending_->audio_done && !pending_->commit_requested) {
                 pending_->commit_requested = true;
-                pending_->phase = 1;
+                pending_->stage = WorkflowStage::ResumingCapture;
                 if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                     pending_->operation_id})) {
                     transport_.store(Transport::Error);
@@ -758,10 +811,10 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             return;
         case WorkerResultCode::PlaybackStopped:
             if (pending_->kind == OperationKind::EjectStorage) {
-                if (pending_->phase != 0) return;
+                if (pending_->stage != WorkflowStage::WaitingForWorkers) return;
                 pending_->audio_done = true;
                 if (pending_->file_done) {
-                    pending_->phase = 1;
+                    pending_->stage = WorkflowStage::ResumingCapture;
                     if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                         pending_->operation_id})) {
                         transport_.store(Transport::Live);
@@ -772,11 +825,11 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 return;
             }
             if (pending_->kind != OperationKind::StopPlayback) return;
-            if (pending_->phase != 0) return;
+            if (pending_->stage != WorkflowStage::WaitingForWorkers) return;
             pending_->audio_done = true;
             if (pending_->file_done && !pending_->commit_requested) {
                 pending_->commit_requested = true;
-                pending_->phase = 1;
+                pending_->stage = WorkflowStage::ResumingCapture;
                 if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                     pending_->operation_id})) {
                     transport_.store(Transport::Error);
@@ -789,10 +842,10 @@ void SystemController::handle_worker_result(const MainMessage& message) {
             if (pending_->kind == OperationKind::EjectStorage &&
                 pending_->argument ==
                     static_cast<uint32_t>(Transport::Playback) &&
-                pending_->phase == 0) {
+                pending_->stage == WorkflowStage::WaitingForWorkers) {
                 pending_->audio_done = true;
                 if (pending_->file_done) {
-                    pending_->phase = 1;
+                    pending_->stage = WorkflowStage::ResumingCapture;
                     if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                         pending_->operation_id})) {
                         transport_.store(Transport::Error);
@@ -803,11 +856,11 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 return;
             }
             if (pending_->kind == OperationKind::StopPlayback &&
-                pending_->phase == 0) {
+                pending_->stage == WorkflowStage::WaitingForWorkers) {
                 pending_->audio_done = true;
                 if (pending_->file_done && !pending_->commit_requested) {
                     pending_->commit_requested = true;
-                    pending_->phase = 1;
+                    pending_->stage = WorkflowStage::ResumingCapture;
                     if (!request_audio({AudioEngine::RequestKind::ResumeCapture,
                                         pending_->operation_id})) {
                         transport_.store(Transport::Error);
@@ -836,10 +889,10 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                     complete_operation(false, pending_->error_code);
                     return;
                 }
-                FileIOManager::Request eject_request;
-                eject_request.kind = FileIOManager::RequestKind::Eject;
+                FileIoManager::Request eject_request;
+                eject_request.kind = FileIoManager::RequestKind::Eject;
                 eject_request.operation_id = pending_->operation_id;
-                pending_->phase = 2;
+                pending_->stage = WorkflowStage::EjectingStorage;
                 if (!request_file(move(eject_request))) {
                     transport_.store(Transport::Live);
                     complete_operation(false, static_cast<uint8_t>(Error::Busy));
@@ -847,7 +900,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
                 return;
             }
             if (pending_->kind == OperationKind::StopPlayback) {
-                if (pending_->phase != 1) return;
+                if (pending_->stage != WorkflowStage::ResumingCapture) return;
                 pending_->audio_done = true;
                 if (pending_->file_done) {
                     transport_.store(pending_->error_code == 0
@@ -885,6 +938,7 @@ void SystemController::handle_worker_result(const MainMessage& message) {
     }
 }
 
+// Clear the pending request and send its final result, capabilities and state to the GUI.
 void SystemController::complete_operation(bool success, uint8_t error_code) {
     if (!pending_.has_value()) return;
     const auto operation = *pending_;
@@ -897,6 +951,11 @@ void SystemController::complete_operation(bool success, uint8_t error_code) {
                     : phono::protocol::Result::Failed,
             success ? 0U : static_cast<uint32_t>(error_code));
     }
+    broadcastStatus();
+}
+
+// These methods enqueue replies. Only th_Network writes to the TCP socket.
+void SystemController::broadcastStatus() {
     publish_status();
     publish_state();
 }
@@ -920,7 +979,7 @@ void SystemController::publish_status() {
                                  : (led_error_.load()
                                         ? static_cast<unsigned>(Error::LedDriverError)
                                         : 0U))};
-    network_.queue_control(make_status_packet(status));
+    network_.sendStatus(status);
 }
 
 void SystemController::publish_state() {
@@ -928,7 +987,7 @@ void SystemController::publish_state() {
     unsigned mode;
     unsigned gain;
     {
-        lock_guard<mutex> lock(configuration_mutex_);
+        PthreadLock lock(configuration_mutex_);
         mode = mode_.load();
         gain = gain_.load();
     }
@@ -956,12 +1015,15 @@ void SystemController::publish_command_result(
 }
 
 void SystemController::update_leds() {
-    const bool ok =
-        led_driver_.set_mode(static_cast<FilterMode>(mode_.load()),
-                             recording_.load());
+    // Write the complete target mask once; never erase the selected mode on STOP.
+    uint8_t mask = recording_.load() ? 0x08 : 0;
+    const uint8_t mode_masks[] = {0x04, 0x01, 0x02};
+    mask |= mode_masks[min(mode_.load(), 2U)];
+    const bool ok = led_driver_.writeByte(mask);
     led_error_.store(!ok);
 }
 
+// Keep stable connection-scoped IDs for unchanged files, using filesystem identity.
 void SystemController::handle_archive_result(const MainMessage& message) {
     archive_entries_.clear();
     for (const auto& identity : message.archive) {
@@ -1032,7 +1094,7 @@ void SystemController::queue_archive_page(uint32_t cursor) {
     const bool more = start + page.size() < archive_entries_.size();
     const auto next_cursor = more && !page.empty() ? page.back().id : 0;
     try {
-        network_.queue_control(make_file_list_packet(next_cursor, page));
+        network_.sendFileList(next_cursor, page);
         complete_operation(true);
     } catch (const exception& error) {
         cerr << "Cannot serialize archive page: " << error.what() << '\n';
@@ -1040,7 +1102,7 @@ void SystemController::queue_archive_page(uint32_t cursor) {
     }
 }
 
-string SystemController::generate_filename(FilterMode mode) {
+string SystemController::generateFilename(FilterMode mode) {
     const auto now =
         chrono::system_clock::to_time_t(chrono::system_clock::now());
     tm local{};
@@ -1057,11 +1119,17 @@ string SystemController::generate_filename(FilterMode mode) {
 void SystemController::set_error(uint8_t error_code) {
     error_code_.store(error_code);
     if (error_code != 0) {
-        led_error_.store(!led_driver_.write(0xff));
+        led_error_.store(!led_driver_.triggerErrorPulse());
     }
 }
 
 void SystemController::set_main_thread_policy() {
+    // Main and Network are peers: SCHED_OTHER priority 0, nice 0.
+    sched_param normal_priority{};
+    const int policy_error = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority);
+    if (policy_error != 0) cerr << "Cannot set normal scheduling: " << strerror(policy_error) << '\n';
+    if (setpriority(PRIO_PROCESS, 0, 0) != 0) cerr << "Cannot set nice 0: " << strerror(errno) << '\n';
+
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
     CPU_SET(0, &cpus);
@@ -1073,7 +1141,7 @@ void SystemController::set_main_thread_policy() {
     }
 }
 
-bool SystemController::init_udev_monitor() {
+bool SystemController::initUdevMonitor() {
     udev_context_ = udev_new();
     if (udev_context_ == nullptr) {
         cerr << "Cannot initialize udev context\n";
@@ -1105,7 +1173,8 @@ bool SystemController::init_udev_monitor() {
     return true;
 }
 
-void SystemController::check_usb_events() {
+// Poll udev without blocking Main; mount/unmount/file work stays in FileIO.
+void SystemController::checkUsbEvents() {
     if (udev_fd_ < 0) return;
     pollfd event{udev_fd_, POLLIN, 0};
     const int ready = ::poll(&event, 1, 0);
@@ -1135,19 +1204,19 @@ void SystemController::check_usb_events() {
         const char* filesystem_type =
             udev_device_get_property_value(device, "ID_FS_TYPE");
         if (usb_parent != nullptr && action != nullptr) {
-            FileIOManager::Request request;
+            FileIoManager::Request request;
             request.path = device_node != nullptr ? device_node : "";
             if (strcmp(action, "remove") == 0 && device_node != nullptr) {
-                request.kind = FileIOManager::RequestKind::DeviceRemoved;
+                request.kind = FileIoManager::RequestKind::DeviceRemoved;
                 deferred_storage_request_ = move(request);
             } else if ((strcmp(action, "add") == 0 ||
                         strcmp(action, "change") == 0) &&
                        device_node != nullptr && filesystem_type != nullptr) {
-                request.kind = FileIOManager::RequestKind::Mount;
+                request.kind = FileIoManager::RequestKind::Mount;
                 request.filesystem_type = filesystem_type;
                 deferred_storage_request_ = move(request);
             } else {
-                request.kind = FileIOManager::RequestKind::RefreshStorage;
+                request.kind = FileIoManager::RequestKind::RefreshStorage;
                 deferred_storage_request_ = move(request);
             }
         }
@@ -1169,6 +1238,7 @@ void SystemController::dispatch_deferred_operation_request() {
     }
 }
 
+// EOF uses the same asynchronous close/resume coordination as an explicit stop.
 void SystemController::start_playback_cleanup(uint32_t operation_id,
                                               bool report_result,
                                               uint8_t error_code) {
@@ -1176,10 +1246,10 @@ void SystemController::start_playback_cleanup(uint32_t operation_id,
     pending_ = PendingOperation{OperationKind::StopPlayback,
                                 phono::protocol::Command::StopPlayback,
                                 operation_id, 0, false, false, error_code,
-                                report_result, true, 1};
+                                report_result, true, WorkflowStage::ResumingCapture};
     transport_.store(phono::protocol::Transport::Stopping);
-    FileIOManager::Request file_request;
-    file_request.kind = FileIOManager::RequestKind::StopPlayback;
+    FileIoManager::Request file_request;
+    file_request.kind = FileIoManager::RequestKind::StopPlayback;
     file_request.operation_id = operation_id;
     if (!request_file(move(file_request))) {
         pending_->file_done = true;
@@ -1209,8 +1279,8 @@ void SystemController::fail_start_playback(uint8_t error_code) {
     pending_->file_done = false;
     pending_->audio_done = false;
 
-    FileIOManager::Request stop_request;
-    stop_request.kind = FileIOManager::RequestKind::StopPlayback;
+    FileIoManager::Request stop_request;
+    stop_request.kind = FileIoManager::RequestKind::StopPlayback;
     stop_request.operation_id = pending_->operation_id;
     if (!request_file(move(stop_request))) {
         pending_->file_done = true;

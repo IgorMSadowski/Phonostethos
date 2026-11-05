@@ -4,6 +4,7 @@ TOOLCHAIN_FILE := $(abspath app/cmake/buildroot-aarch64.cmake)
 KERNEL_DIR ?= $(BUILDROOT_DIR)/output/build/linux-custom
 HOST_DIR := $(BUILDROOT_DIR)/output/host
 OVERLAY_DIR ?= $(BUILDROOT_DIR)/output/target
+BOOT_DIR ?= $(BUILDROOT_DIR)/output/images/rpi-firmware
 KERNEL_RELEASE = $(shell $(MAKE) -s -C $(KERNEL_DIR) kernelrelease)
 
 .PHONY: all configure build driver install clean
@@ -36,8 +37,8 @@ install: build driver
 		$(OVERLAY_DIR)/etc/udev/rules.d/99-phonostethos-usb.rules
 	install -D -m 0755 kernel-driver/deploy/phonostethos-usb-mount \
 		$(OVERLAY_DIR)/usr/sbin/phonostethos-usb-mount
-	install -D -m 0644 kernel-driver/phonostethos-status-leds-overlay.dts \
-		$(OVERLAY_DIR)/usr/share/phonostethos/phonostethos-status-leds-overlay.dts
+	install -D -m 0644 kernel-driver/build/phonostethos-status-leds.dtbo \
+		$(BOOT_DIR)/overlays/phonostethos-status-leds.dtbo
 	install -D -m 0755 kernel-driver/deploy/S90phonostethos \
 		$(OVERLAY_DIR)/etc/init.d/S90phonostethos
 

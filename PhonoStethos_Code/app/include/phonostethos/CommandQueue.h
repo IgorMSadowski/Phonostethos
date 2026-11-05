@@ -4,9 +4,9 @@
 #include "phonostethos/protocol.h"
 
 #include <chrono>
-#include <condition_variable>
+
 #include <deque>
-#include <mutex>
+#include "phonostethos/ThreadSupport.h"
 #include <vector>
 
 using namespace std;
@@ -50,8 +50,20 @@ struct MainMessage {
     vector<ArchiveIdentity> archive;
 };
 
+// Network and workers enqueue; Main dequeues. Messages contain commands OR results.
 class CommandQueue {
 public:
+    CommandQueue() {
+        initializeMutex(mutex_);
+        initializeCondition(available_);
+    }
+    ~CommandQueue() {
+        pthread_cond_destroy(&available_);
+        pthread_mutex_destroy(&mutex_);
+    }
+    CommandQueue(const CommandQueue&) = delete;
+    CommandQueue& operator=(const CommandQueue&) = delete;
+
     bool enqueue(phono::protocol::CommandPacket command) {
         MainMessage message;
         message.kind = MessageKind::GuiCommand;
@@ -61,19 +73,24 @@ public:
 
     bool enqueue(MainMessage message) {
         {
-            lock_guard<mutex> lock(mutex_);
+            PthreadLock lock(mutex_);
             if (closed_) return false;
             queue_.push_back(move(message));
         }
-        available_.notify_one();
+        pthread_cond_signal(&available_);
         return true;
     }
 
     bool dequeue(MainMessage& message,
                  chrono::milliseconds timeout = chrono::milliseconds(10)) {
-        unique_lock<mutex> lock(mutex_);
-        available_.wait_for(lock, timeout,
-                            [&] { return closed_ || !queue_.empty(); });
+        PthreadLock lock(mutex_);
+        const auto deadline = waitDeadline(timeout.count());
+        while (!closed_ && queue_.empty()) {
+            const int result = pthread_cond_timedwait(
+                &available_, &mutex_, &deadline);
+            if (result == ETIMEDOUT) return false;
+            checkPthread(result);
+        }
         if (queue_.empty()) return false;
         message = move(queue_.front());
         queue_.pop_front();
@@ -82,22 +99,22 @@ public:
 
     void close() {
         {
-            lock_guard<mutex> lock(mutex_);
+            PthreadLock lock(mutex_);
             closed_ = true;
         }
-        available_.notify_all();
+        pthread_cond_broadcast(&available_);
     }
 
-    void notify_all() { available_.notify_all(); }
+    void notify_all() { pthread_cond_broadcast(&available_); }
 
     bool closed() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return closed_;
     }
 
 private:
-    mutable mutex mutex_;
-    condition_variable available_;
+    mutable pthread_mutex_t mutex_;
+    pthread_cond_t available_{};
     deque<MainMessage> queue_;
     bool closed_ = false;
 };

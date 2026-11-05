@@ -28,26 +28,31 @@ void DspProcessor::reset() {
     filter_.reset();
     configured_mode_ = 99;
     frames_since_fft_ = 0;
+    fft_ready_ = false;
 }
 
-void DspProcessor::process_live(const int16_t* input,
-                                int16_t* output, size_t count,
-                                unsigned mode, unsigned gain) {
-    if (mode != configured_mode_) {
-        const auto [low, high] = filter_limits(mode);
+// The existing tested filter has a high-pass stage followed by a low-pass stage.
+void DspProcessor::applyBandpass(const float* input, float* output,
+                                 int count, FilterMode mode) {
+    const auto selected_mode = static_cast<unsigned>(mode);
+    if (selected_mode != configured_mode_) {
+        const auto [low, high] = filter_limits(selected_mode);
         filter_.configure(low, high, kSampleRate);
-        configured_mode_ = mode;
+        configured_mode_ = selected_mode;
     }
+    for (int i = 0; i < count; ++i) output[i] = static_cast<float>(filter_.process(input[i]));
+}
 
-    for (size_t i = 0; i < count; ++i) {
-        const double filtered = filter_.process(input[i]);
-        output[i] = static_cast<int16_t>(
-            clamp(filtered * gain, -32768.0, 32767.0));
+void DspProcessor::applyGainWithLimiter(const float* input, int16_t* output,
+                                       int count, int gain) {
+    for (int i = 0; i < count; ++i) {
+        output[i] = static_cast<int16_t>(clamp(input[i] * gain, -32768.0F, 32767.0F));
     }
 }
 
-optional<Telemetry> DspProcessor::analyze(const int16_t* samples,
-                                                size_t count) {
+void DspProcessor::computeFFT(const int16_t* samples, float* magnitudes, int sample_count) {
+    const auto count = static_cast<size_t>(sample_count);
+    fft_ready_ = false;
     for (size_t i = 0; i < count; ++i) {
         history_[history_next_] = static_cast<float>(samples[i]) / 32768.0F;
         history_next_ = (history_next_ + 1) % kFftFrames;
@@ -55,7 +60,7 @@ optional<Telemetry> DspProcessor::analyze(const int16_t* samples,
     }
     frames_since_fft_ += count;
     if (frames_since_fft_ < kPeriodFrames || history_size_ < kFftFrames) {
-        return nullopt;
+        return;
     }
     frames_since_fft_ %= kPeriodFrames;
     for (size_t i = 0; i < kFftFrames; ++i) {
@@ -73,14 +78,12 @@ optional<Telemetry> DspProcessor::analyze(const int16_t* samples,
     }
     fftwf_execute(fft_plan_);
 
-    Telemetry telemetry;
-    telemetry.waveform = waveform_;
     for (size_t bin = 0; bin < kFftBins; ++bin) {
-        telemetry.spectrum[bin] =
+        magnitudes[bin] =
             hypot(fft_output_[bin][0], fft_output_[bin][1]) / window_sum *
             (bin == 0 ? 1.0F : 2.0F);
     }
-    return telemetry;
+    fft_ready_ = true;
 }
 
 pair<double, double> DspProcessor::filter_limits(unsigned mode) {

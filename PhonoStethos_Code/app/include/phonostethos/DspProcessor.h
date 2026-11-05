@@ -24,10 +24,11 @@ public:
 
     bool initialize();
     void reset();
-    void process_live(const int16_t* input, int16_t* output,
-                      size_t count, unsigned mode, unsigned gain);
-    optional<Telemetry> analyze(const int16_t* samples,
-                                     size_t count);
+    void applyBandpass(const float* input, float* output, int count, FilterMode mode);
+    void applyGainWithLimiter(const float* input, int16_t* output, int count, int gain);
+    void computeFFT(const int16_t* samples, float* magnitudes, int count);
+    bool fftReady() const { return fft_ready_; }
+    const array<float, kFftFrames>& waveform() const { return waveform_; }
 
 private:
     static pair<double, double> filter_limits(unsigned mode);
@@ -42,5 +43,6 @@ private:
     BandPassFilter filter_;
     unsigned configured_mode_ = 99;
     size_t frames_since_fft_ = 0;
+    bool fft_ready_ = false;
 };
 }  // namespace phono_app

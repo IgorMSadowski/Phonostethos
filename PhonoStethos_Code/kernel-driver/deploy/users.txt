@@ -1,0 +1,2 @@
+# Buildroot BR2_ROOTFS_USERS_TABLE: service user + matching LED device group.
+phonostethos -1 phonostethos -1 * /var/empty /bin/false audio PhonoStethos service

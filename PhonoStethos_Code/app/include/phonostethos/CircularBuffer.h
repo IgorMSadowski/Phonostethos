@@ -3,20 +3,32 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <condition_variable>
+
 #include <cstddef>
-#include <mutex>
+#include "phonostethos/ThreadSupport.h"
 
 using namespace std;
 
 namespace phono_app {
+// Two independent objects use this class: recordingBuffer and playbackBuffer.
 template <typename T, size_t Capacity>
 class CircularBuffer {
     static_assert(Capacity > 0, "CircularBuffer capacity must be positive");
 
 public:
+    CircularBuffer() {
+        initializeMutex(mutex_);
+        initializeCondition(data_available_);
+    }
+    ~CircularBuffer() {
+        pthread_cond_destroy(&data_available_);
+        pthread_mutex_destroy(&mutex_);
+    }
+    CircularBuffer(const CircularBuffer&) = delete;
+    CircularBuffer& operator=(const CircularBuffer&) = delete;
+
     bool begin_session() {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         if (count_ != 0) return false;
         head_ = 0;
         tail_ = 0;
@@ -26,23 +38,29 @@ public:
     }
 
     bool push(const T* data, size_t length) {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         if (!accepting_ || length > Capacity - count_) return false;
         for (size_t i = 0; i < length; ++i) {
             data_[head_] = data[i];
             head_ = (head_ + 1) % Capacity;
         }
         count_ += length;
-        data_available_.notify_one();
+        pthread_cond_signal(&data_available_);
         return true;
     }
 
     size_t pop(T* destination, size_t maximum_length,
                chrono::milliseconds timeout = chrono::milliseconds(10)) {
-        unique_lock<mutex> lock(mutex_);
-        data_available_.wait_for(lock, timeout, [&] {
-            return count_ != 0 || stopped_;
-        });
+        PthreadLock lock(mutex_);
+        const auto deadline = waitDeadline(timeout.count());
+        // Waiting releases mutex_; it is locked again before the call returns.
+        // Always recheck: a wake-up alone does not mean samples are available.
+        while (count_ == 0 && !stopped_) {
+            const int result = pthread_cond_timedwait(
+                &data_available_, &mutex_, &deadline);
+            if (result == ETIMEDOUT) break;
+            checkPthread(result);
+        }
         const auto length = min(maximum_length, count_);
         for (size_t i = 0; i < length; ++i) {
             destination[i] = data_[tail_];
@@ -53,50 +71,50 @@ public:
     }
 
     void stop_producing() {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         accepting_ = false;
         stopped_ = true;
-        data_available_.notify_all();
+        pthread_cond_broadcast(&data_available_);
     }
 
     void clear() {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         head_ = 0;
         tail_ = 0;
         count_ = 0;
         accepting_ = false;
         stopped_ = true;
-        data_available_.notify_all();
+        pthread_cond_broadcast(&data_available_);
     }
 
     bool isFull() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return count_ == Capacity;
     }
 
     bool isEmpty() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return count_ == 0;
     }
 
     size_t size() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return count_;
     }
 
     size_t available_capacity() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return Capacity - count_;
     }
 
     bool stopped() const {
-        lock_guard<mutex> lock(mutex_);
+        PthreadLock lock(mutex_);
         return stopped_;
     }
 
 private:
-    mutable mutex mutex_;
-    condition_variable data_available_;
+    mutable pthread_mutex_t mutex_;
+    pthread_cond_t data_available_{};
     array<T, Capacity> data_{};
     size_t head_ = 0;
     size_t tail_ = 0;
