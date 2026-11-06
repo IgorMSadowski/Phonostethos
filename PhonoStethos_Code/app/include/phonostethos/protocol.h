@@ -198,10 +198,24 @@ inline bool decode_command(const uint8_t* bytes, size_t size,
     return true;
 }
 
+// Keep the existing integer wire values and reserve three codes for attenuation.
+inline constexpr bool valid_gain_code(uint32_t code) {
+    return (code >= 1 && code <= 20) || (code >= 101 && code <= 103);
+}
+
+inline constexpr float gain_multiplier(uint32_t code) {
+    switch (code) {
+        case 101: return 0.5F;
+        case 102: return 0.75F;
+        case 103: return 0.8F;
+        default: return valid_gain_code(code) ? static_cast<float>(code) : 1.0F;
+    }
+}
+
 inline bool valid_command_value(const CommandPacket& command) {
     switch (command.type) {
         case Command::SetMode: return command.value <= 2;
-        case Command::SetGain: return command.value >= 1 && command.value <= 10;
+        case Command::SetGain: return valid_gain_code(command.value);
         case Command::PlayAudio:
         case Command::GetArchive:
         case Command::DeleteRecording:
@@ -463,7 +477,7 @@ inline bool decode_state(const vector<uint8_t>& payload,
                          State& state) {
     if (payload.size() != kStatePayloadBytes ||
         payload[0] != kProtocolVersion || payload[1] > 5 ||
-        payload[2] > 2 || payload[3] < 1 || payload[3] > 10 ||
+        payload[2] > 2 || !valid_gain_code(payload[3]) ||
         payload[4] > 0x1f || payload[5] > 19 ||
         read_u16_be(payload.data() + 6) != 0) {
         return false;

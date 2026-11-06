@@ -44,7 +44,7 @@ void DspProcessor::applyBandpass(const float* input, float* output,
 }
 
 void DspProcessor::applyGainWithLimiter(const float* input, int16_t* output,
-                                       int count, int gain) {
+                                       int count, float gain) {
     for (int i = 0; i < count; ++i) {
         output[i] = static_cast<int16_t>(clamp(input[i] * gain, -32768.0F, 32767.0F));
     }

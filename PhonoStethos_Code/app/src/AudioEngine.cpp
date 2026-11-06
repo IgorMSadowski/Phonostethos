@@ -322,6 +322,7 @@ void AudioEngine::run() {
     array<float, kPeriodFrames> floating_input{};
     array<float, kPeriodFrames> filtered{};
     array<float, kFftBins> magnitudes{};
+    float applied_gain = phono::protocol::gain_multiplier(gain_.load());
     bool capture_suspended = false;
     bool playback_active = false;
     bool playback_completion_sent = false;
@@ -346,6 +347,7 @@ void AudioEngine::run() {
         }
 
         snd_pcm_sframes_t count = 0;
+        unsigned gain_code = gain_.load();
         if (playback_active) {
             const auto samples = playback_buffer_.pop(
                 output.data(), output.size(), chrono::milliseconds(10));
@@ -379,6 +381,9 @@ void AudioEngine::run() {
                     playback_active = false;
                 }
             }
+            for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+                filtered[i] = static_cast<float>(output[i]);
+            }
         } else if (!capture_suspended) {
             while (count < static_cast<snd_pcm_sframes_t>(input.size()) &&
                    !stop_requested_.load() && !capture_suspended) {
@@ -400,23 +405,43 @@ void AudioEngine::run() {
             if (capture_suspended || count == 0) continue;
 
             unsigned mode;
-            unsigned gain;
             {
                 PthreadLock lock(configuration_mutex_);
                 mode = mode_.load();
-                gain = gain_.load();
+                gain_code = gain_.load();
             }
             for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
                 floating_input[i] = static_cast<float>(input[i]);
             }
             dsp_.applyBandpass(floating_input.data(), filtered.data(),
                               static_cast<int>(count), static_cast<FilterMode>(mode));
-            dsp_.applyGainWithLimiter(filtered.data(), output.data(),
-                                     static_cast<int>(count), static_cast<int>(gain));
         } else {
             const timespec pause{0, 1000000L};
             nanosleep(&pause, nullptr);
             continue;
+        }
+
+        // Blend changes over 20 ms so moving the slider cannot jump the waveform.
+        const float target_gain = phono::protocol::gain_multiplier(gain_code);
+        constexpr auto ramp_frames = kSampleRate / 50;
+        const auto ramp_count = min<snd_pcm_sframes_t>(count, ramp_frames);
+        if (ramp_count > 0 && applied_gain != target_gain) {
+            const float start_gain = applied_gain;
+            for (snd_pcm_sframes_t i = 0; i < ramp_count; ++i) {
+                const float progress = static_cast<float>(i + 1) / ramp_frames;
+                filtered[i] *= start_gain + (target_gain - start_gain) * progress;
+            }
+            applied_gain = start_gain + (target_gain - start_gain) *
+                (static_cast<float>(ramp_count) / ramp_frames);
+            if (ramp_count == ramp_frames) applied_gain = target_gain;
+            dsp_.applyGainWithLimiter(filtered.data(), output.data(),
+                                      static_cast<int>(ramp_count), 1.0F);
+            dsp_.applyGainWithLimiter(filtered.data() + ramp_count,
+                                      output.data() + ramp_count,
+                                      static_cast<int>(count - ramp_count), target_gain);
+        } else {
+            dsp_.applyGainWithLimiter(filtered.data(), output.data(),
+                                      static_cast<int>(count), target_gain);
         }
 
         snd_pcm_sframes_t written = 0;

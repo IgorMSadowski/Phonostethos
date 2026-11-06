@@ -25,7 +25,7 @@ public:
     bool initialize();
     void reset();
     void applyBandpass(const float* input, float* output, int count, FilterMode mode);
-    void applyGainWithLimiter(const float* input, int16_t* output, int count, int gain);
+    void applyGainWithLimiter(const float* input, int16_t* output, int count, float gain);
     void computeFFT(const int16_t* samples, float* magnitudes, int count);
     bool fftReady() const { return fft_ready_; }
     const array<float, kFftFrames>& waveform() const { return waveform_; }

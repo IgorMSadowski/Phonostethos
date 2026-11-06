@@ -38,10 +38,10 @@ public:
     void setGain(int gain);
     void startRecording();
     void stopRecording();
-    void startPlayback();
+    void startPlayback(uint32_t file_id);
     void stopPlayback();
     void ejectStorage();
-    void listFiles();
+    void listFiles(uint32_t cursor);
     void deleteRecording(uint32_t file_id);
     void broadcastStatus();
 
@@ -138,8 +138,6 @@ private:
     uint32_t next_session_id_ = 1;
     uint32_t next_operation_id_ = 1;
     optional<PendingOperation> pending_;
-    // Only Main reads/writes this: argument retained for no-argument diagram methods.
-    phono::protocol::CommandPacket current_command_{};
     bool initialized_ = false;
     bool stopping_ = false;
     chrono::steady_clock::time_point next_storage_check_{};

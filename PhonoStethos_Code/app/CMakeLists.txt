@@ -47,6 +47,8 @@ if(PHONO_BUILD_SERVER)
         src/NetworkManager.cpp
         src/main.cpp
         src/SystemController.cpp
+        src/SystemControllerCommands.cpp
+        src/SystemControllerResults.cpp
     )
     target_include_directories(phonostethos-server PRIVATE include)
     target_link_libraries(phonostethos-server PRIVATE

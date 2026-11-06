@@ -195,8 +195,8 @@ class FrameDecoder {
     if (bytes[0] != 1 ||
         bytes[1] >= Transport.values.length ||
         bytes[2] > 2 ||
-        bytes[3] < 1 ||
-        bytes[3] > 10 ||
+        !((bytes[3] >= 1 && bytes[3] <= 20) ||
+            (bytes[3] >= 101 && bytes[3] <= 103)) ||
         bytes[4] > 0x1f ||
         bytes[5] > 19 ||
         data.getUint16(6, Endian.big) != 0) {

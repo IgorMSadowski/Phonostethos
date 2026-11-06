@@ -1,3 +1,4 @@
+import 'dart:math' show sqrt;
 import 'dart:async';
 import 'dart:io';
 
@@ -53,9 +54,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Command? _pendingCommand;
   int? _archiveCursor;
   int _mode = 0;
+  static const _gainCodes = [
+    101, 102, 103, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+  ];
   int _gain = 1;
+  int? _gainPreview;
+  String _gainLabel(int code) => switch (code) {
+    101 => '0.5×',
+    102 => '0.75×',
+    103 => '0.8×',
+    _ => '$code×',
+  };
   Transport _transport = Transport.live;
   List<FlSpot> _waveform = const [FlSpot(0, 0)];
+  List<double> _spectrumPower = [];
+  List<FlSpot> _spectrumPeaks = [];
+  final _spectrumClock = Stopwatch()..start();
+  int _lastSpectrumUs = 0;
   List<FlSpot> _spectrum = const [FlSpot(0, -120)];
 
   @override
@@ -124,6 +140,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _errorText = 'Server error ${status.errorCode}';
           }
         case StateMessage state:
+          if (_transport != state.transport || _mode != state.filter ||
+              _gain != state.gain) {
+            _spectrumPower = [];
+            _spectrumPeaks = [];
+          }
           _transport = state.transport;
           _mode = state.filter;
           _gain = state.gain;
@@ -136,11 +157,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
             (index) => FlSpot(index.toDouble(), data.waveform[index]),
             growable: false,
           );
+          // Lightly smooth power and display every received spectrum.
+          if (_spectrumPower.length != data.spectrum.length) {
+            _spectrumPower = data.spectrum.map((value) => value * value).toList();
+          } else {
+            for (var i = 0; i < data.spectrum.length; i++) {
+              final amplitude = data.spectrum[i];
+              _spectrumPower[i] =
+                  0.35 * _spectrumPower[i] + 0.65 * amplitude * amplitude;
+            }
+          }
+          final visibleHz = _modeBand(_mode).end;
+          final visibleBins = (visibleHz * 1024 / 8000).floor() + 1;
+          final now = _spectrumClock.elapsedMicroseconds;
+          final decayDb = (now - _lastSpectrumUs) * 8 / 1000000;
+          _lastSpectrumUs = now;
+          final previousPeaks = _spectrumPeaks;
+          _spectrumPeaks = List<FlSpot>.generate(visibleBins, (index) {
+            final current = spectrumDbfs(data.spectrum[index]);
+            final previous = index < previousPeaks.length
+                ? previousPeaks[index].y - decayDb
+                : current;
+            return FlSpot(index * (8000 / 1024),
+                current > previous ? current : previous);
+          }, growable: false);
           _spectrum = List<FlSpot>.generate(
-            data.spectrum.length,
+            visibleBins,
             (index) => FlSpot(
               index * (8000 / 1024),
-              spectrumDbfs(data.spectrum[index]),
+              spectrumDbfs(sqrt(_spectrumPower[index])),
             ),
             growable: false,
           );
@@ -330,12 +375,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Expanded(
                 child: _chartPanel(
                   'Frequency spectrum · ${_modeName(_mode)}',
-                  '${_bandDescription(_mode)} highlighted · 7.8 Hz/bin · dBFS',
+                  '${_bandDescription(_mode)} · orange: live · cyan: recent peaks',
                   _spectrum,
                   Colors.orangeAccent,
                   minY: -90,
                   maxY: 0,
-                  maxX: 4000,
+                  maxX: _modeBand(_mode).end,
+                  peakSpots: _spectrumPeaks,
                   highlightedRange: _modeBand(_mode),
                   frequencyAxis: true,
                 ),
@@ -382,17 +428,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
             const Divider(),
             Row(
               children: [
-                const Expanded(child: Text('Digital Dynamic Gain')),
-                Text('$_gain×'),
+                const Expanded(child: Text('Gain (live and playback)')),
+                Text(_gainLabel(_gainPreview ?? _gain)),
               ],
             ),
             Slider(
-              value: _gain.toDouble(),
-              min: 1,
-              max: 10,
-              divisions: 9,
-              label: '${_gain}x',
-              onChanged: _enabled ? (value) => _sendGain(value.round()) : null,
+              value: _gainCodes.indexOf(_gainPreview ?? _gain)
+                  .clamp(0, _gainCodes.length - 1).toDouble(),
+              max: (_gainCodes.length - 1).toDouble(),
+              divisions: _gainCodes.length - 1,
+              label: _gainLabel(_gainPreview ?? _gain),
+              onChanged: _enabled
+                  ? (value) => setState(() => _gainPreview = _gainCodes[value.round()])
+                  : null,
+              onChangeEnd: _enabled ? (value) {
+                setState(() => _gainPreview = null);
+                _sendGain(_gainCodes[value.round()]);
+              } : null,
             ),
             const Text('Live Audio Capture'),
             const SizedBox(height: 12),
@@ -443,7 +495,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   void _sendGain(int value) {
-    setState(() => _gain = value);
     _request(Command.setGain, value);
   }
 
@@ -575,6 +626,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     required double maxX,
     RangeValues? highlightedRange,
     bool frequencyAxis = false,
+    List<FlSpot> peakSpots = const [],
   }) =>
       Card(
         child: Padding(
@@ -608,7 +660,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             frequencyAxis ? const Text('Frequency (Hz)') : null,
                         sideTitles: SideTitles(
                           showTitles: frequencyAxis,
-                          interval: 1000,
+                          interval: maxX <= 600 ? 100 : maxX / 4,
                           reservedSize: 28,
                           getTitlesWidget: (value, meta) => SideTitleWidget(
                             meta: meta,
@@ -656,6 +708,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ],
                     ),
                     lineBarsData: [
+                      if (peakSpots.isNotEmpty)
+                        LineChartBarData(
+                          spots: peakSpots,
+                          color: Colors.cyanAccent.withValues(alpha: 0.7),
+                          barWidth: 1,
+                          dotData: const FlDotData(show: false),
+                        ),
                       LineChartBarData(
                         spots: spots,
                         color: color,

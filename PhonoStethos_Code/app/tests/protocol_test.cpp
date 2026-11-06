@@ -95,6 +95,15 @@ int main() {
         return 12;
     }
 
+    for (const uint8_t gain : {11, 20, 101, 102, 103}) {
+        state_frame.payload[3] = gain;
+        if (!decode_state(state_frame.payload, state) || state.gain != gain) {
+            return 18;
+        }
+    }
+    state_frame.payload[3] = 21;
+    if (decode_state(state_frame.payload, state)) return 19;
+
     const auto result_packet = make_command_result_packet(
         {Command::StartRecording, Result::AcceptedPending, 0});
     if (result_packet.size() != 13 || result_packet[0] != kCommandResult ||
