@@ -23,3 +23,11 @@
 /app/.dart_tool/
 /app/.flutter-plugins-dependencies
 /app/linux/flutter/ephemeral/
+# Practical diagnostics: keep sources and guides; ignore generated binaries.
+!/HardwareTests/
+!/SystemTests/
+/HardwareTests/**/build-pi/
+/HardwareTests/**/build-host/
+/SystemTests/**/build-pi/
+/SystemTests/**/build-host/
+/SystemTests/**/__pycache__/
