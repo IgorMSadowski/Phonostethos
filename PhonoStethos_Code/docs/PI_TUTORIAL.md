@@ -27,7 +27,7 @@ make driver
 file app/build-pi/phonostethos-server
 ```
 
-The outputs are app/build-pi/phonostethos-server, kernel-driver/phonostethos_leds.ko and kernel-driver/build/phonostethos-status-leds.dtbo. The binary needs ALSA, FFTW3f, libsndfile and libudev runtime libraries in the target root filesystem. Use the same SDK/image pair. The LED module must come from the build of the exact running kernel, including its configuration and symbol versions.
+The outputs are app/build-pi/phonostethos-server and kernel-driver/phonostethos_leds.ko. The binary needs ALSA, FFTW3f, libsndfile and libudev runtime libraries in the target root filesystem. Use the same SDK/image pair. The LED module must come from the build of the exact running kernel, including its configuration and symbol versions.
 
 ## 3. Copy and run a foreground test
 
@@ -86,20 +86,23 @@ End the foreground test with Ctrl+C after ejecting. Ejection protects the USB vo
 
 ## 5. Enable LEDs and install the service
 
-First locate the firmware boot partition containing config.txt. On an image mounted on the laptop, that is the firmware partition's root. Install phonostethos-status-leds.dtbo into its overlays directory and add this line under the applicable firmware section:
+Copy the matching `phonostethos_leds.ko` to the Pi and load it with `insmod /path/to/phonostethos_leds.ko` if the service has not already loaded it. No Device Tree overlay or firmware `config.txt` change is required. Check `dmesg | tail` and `ls -l /dev/phonostethos_leds`. This driver uses the fixed BCM2711 GPIO base address and is for Raspberry Pi 4 only. Do not control these GPIO pins through another driver at the same time.
 
-```ini
-dtoverlay=phonostethos-status-leds
+For a manual output test, the mask `0x05` turns on Heart and General; `0x00` turns all LEDs off:
+
+```sh
+printf '\005' > /dev/phonostethos_leds
+printf '\000' > /dev/phonostethos_leds
 ```
 
-Put the matching phonostethos_leds.ko at /lib/modules/<kernel-release>/extra/phonostethos_leds.ko on the Pi root filesystem, then reboot to apply the overlay. Run `insmod /lib/modules/$(uname -r)/extra/phonostethos_leds.ko` if the service has not already loaded it. Check `dmesg | tail` and `ls -l /dev/phonostethos_leds`. Test mode LEDs and the recording LED from the GUI. A successful device write cannot detect an unplugged LED.
+Test mode LEDs and the recording LED from the GUI. A successful device write cannot detect an unplugged LED.
 
 For a repeatable Buildroot image, create your own staging directories and run from the laptop:
 
 ```sh
-make install OVERLAY_DIR="$PWD/pi-rootfs-stage" BOOT_DIR="$PWD/pi-boot-stage"
+make install OVERLAY_DIR="$PWD/pi-rootfs-stage"
 ```
 
-The root staging directory contains the server, matching module, udev rules, USB helper and /etc/init.d/S90phonostethos. Merge those files into the Buildroot rootfs overlay or image through your board configuration. Include kernel-driver/deploy/users.txt in BR2_ROOTFS_USERS_TABLE so udev can assign group phonostethos. Merge the DTBO into the boot image and retain the config.txt line in the board’s boot configuration. Configure the Ethernet address before S90 starts, and edit the service command if the Pi needs custom ALSA device names.
+The root staging directory contains the server, matching module, udev rules, USB helper and /etc/init.d/S90phonostethos. Merge those files into the Buildroot rootfs overlay or image through your board configuration. Include kernel-driver/deploy/users.txt in BR2_ROOTFS_USERS_TABLE so udev can assign group phonostethos. Configure the Ethernet address before S90 starts, and edit the service command if the Pi needs custom ALSA device names.
 
 Once the image is booted, use `/etc/init.d/S90phonostethos start` and `stop` on the Pi. The script starts the server in the background and saves its PID. Use the foreground procedure whenever startup output is needed.

@@ -61,7 +61,7 @@ int main() {
     options.require_mounted_storage = false;
     const auto path = options.storage / "GENERAL_20261104_120000_000001.wav";
     CommandQueue messages;
-    CircularBuffer<int16_t, kCircularBufferSamples> recording, playback;
+    CircularBuffer recording, playback;
     FileIoManager fileio(options, messages, recording, playback);
     assert(fileio.start());
     await_result(messages, WorkerResultCode::FileIOReady, 0);
@@ -122,14 +122,12 @@ int main() {
     {
         LedDriver leds(led_path.string());
         assert(leds.openDriver());
-        assert(leds.setModeLed(FilterMode::General)); // 04
-        assert(leds.setRecordLed(true));             // 0c
-        assert(leds.setModeLed(FilterMode::Heart));   // 09
-        assert(leds.setRecordLed(false));            // 01
-        assert(leds.triggerErrorPulse());            // ff
+        assert(leds.writeByte(0x05)); // HEART + GENERAL
+        assert(leds.writeByte(0x08)); // RECORDING
+        assert(leds.writeByte(0x00)); // All off
     }                                                // 00 on close
     std::ifstream led_bytes(led_path, std::ios::binary);
     const std::vector<unsigned char> actual((std::istreambuf_iterator<char>(led_bytes)), {});
-    assert((actual == std::vector<unsigned char>{4, 12, 9, 1, 255, 0}));
+    assert((actual == std::vector<unsigned char>{0x05, 0x08, 0x00, 0x00}));
     std::filesystem::remove_all(options.storage);
 }

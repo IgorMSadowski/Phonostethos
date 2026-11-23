@@ -45,6 +45,8 @@ struct Telemetry {
     array<float, kFftBins> spectrum{};
 };
 
+// A file ID resolves to this snapshot. Before play/delete, FileIO checks that
+// the file still matches (USB removal/replacement must not select a different file).
 struct ArchiveIdentity {
     string basename;
     dev_t device = 0;

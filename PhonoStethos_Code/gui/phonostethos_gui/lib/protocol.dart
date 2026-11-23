@@ -12,6 +12,15 @@ const int maxFileListPayloadBytes = 8192;
 const int waveformLength = 1024;
 const int spectrumLength = 512;
 
+// The TCP gain field is an integer; its existing codes 1..20 mean 1x..20x.
+// Fractional values cannot be put directly in that field, so unused codes
+// 101..103 identify 0.5x, 0.75x and 0.8x without changing the packet layout.
+// These match protocol.h on the Pi. Its gain_multiplier() converts the code
+// before processing audio. _gainLabel() in main.dart shows the actual volume.
+const int gainHalf = 101; // 0.5x.
+const int gainThreeQuarters = 102; // 0.75x.
+const int gainFourFifths = 103; // 0.8x.
+
 int _readUint32(List<int> bytes, int offset) =>
     ((bytes[offset] & 0xff) << 24) |
     ((bytes[offset + 1] & 0xff) << 16) |
@@ -37,7 +46,7 @@ enum Transport { live, recording, playback, stopping, ejecting, error }
 
 enum CommandOutcome { completed, acceptedPending, rejected, failed }
 
-sealed class ServerMessage {
+abstract class ServerMessage {
   const ServerMessage();
 }
 
@@ -110,6 +119,8 @@ class DataMessage extends ServerMessage {
   final List<double> spectrum;
 }
 
+// TCP may split a frame or put several frames in one chunk.
+// Keep bytes until the complete header and payload can be decoded.
 class FrameDecoder {
   final List<int> _buffer = <int>[];
   bool _failed = false;
@@ -119,6 +130,7 @@ class FrameDecoder {
     _failed = false;
   }
 
+  // Returns only complete messages. Unfinished bytes stay in _buffer.
   List<ServerMessage> add(List<int> bytes) {
     if (_failed) {
       throw const FormatException(
@@ -147,28 +159,49 @@ class FrameDecoder {
       if (length > maxPayloadBytes) {
         _fail('Frame payload exceeds the protocol maximum');
       }
-      final expected = switch (type) {
-        dataType => (waveformLength + spectrumLength) * 4,
-        fileListType => maxFileListPayloadBytes,
-        stateType => 20,
-        commandResultType => 8,
-        _ => -1,
-      };
-      if (expected < 0 ||
-          (type == fileListType ? length > expected : length != expected)) {
+      int expected = -1;
+      switch (type) {
+        case dataType:
+          expected = (waveformLength + spectrumLength) * 4;
+          break;
+        case fileListType:
+          expected = maxFileListPayloadBytes;
+          break;
+        case stateType:
+          expected = 20;
+          break;
+        case commandResultType:
+          expected = 8;
+          break;
+      }
+      bool wrongLength = length != expected;
+      if (type == fileListType) {
+        wrongLength =
+            length > expected; // Archive payloads have variable length.
+      }
+      if (expected < 0 || wrongLength) {
         _fail('Invalid payload length for frame type $type');
       }
       final frameLength = 5 + length;
       if (_buffer.length < frameLength) break;
       final payload = Uint8List.fromList(_buffer.sublist(5, frameLength));
       _buffer.removeRange(0, frameLength);
-      messages.add(switch (type) {
-        dataType => _decodeData(payload),
-        fileListType => _decodeFileList(payload),
-        stateType => _decodeState(payload),
-        commandResultType => _decodeCommandResult(payload),
-        _ => throw const FormatException('Unsupported server frame'),
-      });
+      switch (type) {
+        case dataType:
+          messages.add(_decodeData(payload));
+          break;
+        case fileListType:
+          messages.add(_decodeFileList(payload));
+          break;
+        case stateType:
+          messages.add(_decodeState(payload));
+          break;
+        case commandResultType:
+          messages.add(_decodeCommandResult(payload));
+          break;
+        default:
+          _fail('Unsupported server frame');
+      }
     }
     return messages;
   }
@@ -179,7 +212,7 @@ class FrameDecoder {
   }
 
   StatusMessage _decodeStatus(List<int> bytes) {
-    if (bytes.take(3).any((value) => value > 1) || bytes[3] > 19) {
+    if (bytes[0] > 1 || bytes[1] > 1 || bytes[2] > 1 || bytes[3] > 19) {
       _fail('Invalid Status payload');
     }
     return StatusMessage(
@@ -192,11 +225,15 @@ class FrameDecoder {
 
   StateMessage _decodeState(Uint8List bytes) {
     final data = ByteData.sublistView(bytes);
+    bool integerGain = bytes[3] >= 1 && bytes[3] <= 20;
+    bool fractionalGain = bytes[3] == gainHalf ||
+        bytes[3] == gainThreeQuarters ||
+        bytes[3] == gainFourFifths;
+    bool validGain = integerGain || fractionalGain;
     if (bytes[0] != 1 ||
         bytes[1] >= Transport.values.length ||
         bytes[2] > 2 ||
-        !((bytes[3] >= 1 && bytes[3] <= 20) ||
-            (bytes[3] >= 101 && bytes[3] <= 103)) ||
+        !validGain ||
         bytes[4] > 0x1f ||
         bytes[5] > 19 ||
         data.getUint16(6, Endian.big) != 0) {
@@ -236,9 +273,10 @@ class FrameDecoder {
       _fail('Invalid FileList header');
     }
     final cursorText = lines.first.substring('next_cursor='.length);
-    final cursor = RegExp(r'^[0-9]+$').hasMatch(cursorText)
-        ? int.tryParse(cursorText)
-        : null;
+    int? cursor;
+    if (RegExp(r'^[0-9]+$').hasMatch(cursorText)) {
+      cursor = int.tryParse(cursorText);
+    }
     if (cursor == null || cursor < 0 || cursor > 0xffffffff) {
       _fail('Invalid FileList cursor');
     }
@@ -254,8 +292,10 @@ class FrameDecoder {
         _fail('Invalid FileList entry');
       }
       final idText = line.substring(0, separator);
-      final id =
-          RegExp(r'^[0-9]+$').hasMatch(idText) ? int.tryParse(idText) : null;
+      int? id;
+      if (RegExp(r'^[0-9]+$').hasMatch(idText)) {
+        id = int.tryParse(idText);
+      }
       final name = line.substring(separator + 1);
       if (id == null ||
           id == 0 ||
@@ -279,19 +319,22 @@ class FrameDecoder {
 
   DataMessage _decodeData(Uint8List payload) {
     final bytes = ByteData.sublistView(payload);
-    final waveform = List<double>.generate(
-      waveformLength,
-      (index) => bytes.getFloat32(index * 4, Endian.big),
-      growable: false,
-    );
-    final spectrum = List<double>.generate(
-      spectrumLength,
-      (index) => bytes.getFloat32((waveformLength + index) * 4, Endian.big),
-      growable: false,
-    );
-    if (waveform.any((value) => !value.isFinite) ||
-        spectrum.any((value) => !value.isFinite || value < 0)) {
-      _fail('Telemetry contains invalid floating-point values');
+    // Dart API: ByteData.getFloat32(offset, Endian.big).
+    // Each value occupies four bytes. Decode waveform first, then FFT bins.
+    final waveform = <double>[];
+    final spectrum = <double>[];
+    for (int i = 0; i < waveformLength; i++) {
+      double sample = bytes.getFloat32(i * 4, Endian.big);
+      if (!sample.isFinite) _fail('Telemetry contains invalid waveform values');
+      waveform.add(sample);
+    }
+    for (int i = 0; i < spectrumLength; i++) {
+      int offset = (waveformLength + i) * 4;
+      double magnitude = bytes.getFloat32(offset, Endian.big);
+      if (!magnitude.isFinite || magnitude < 0) {
+        _fail('Telemetry contains invalid spectrum values');
+      }
+      spectrum.add(magnitude);
     }
     return DataMessage(waveform: waveform, spectrum: spectrum);
   }
@@ -301,9 +344,11 @@ Uint8List encodeCommand(Command command, int value) {
   if (value < 0 || value > 0xffffffff) {
     throw RangeError.range(value, 0, 0xffffffff, 'value');
   }
-  final bytes = ByteData(5)
-    ..setUint8(0, command.value)
-    ..setUint32(1, value, Endian.big);
+  // Dart API: ByteData stores explicitly sized binary fields.
+  // Put the command in byte 0 and its unsigned argument in bytes 1 to 4.
+  final bytes = ByteData(5);
+  bytes.setUint8(0, command.value);
+  bytes.setUint32(1, value, Endian.big);
   return bytes.buffer.asUint8List();
 }
 

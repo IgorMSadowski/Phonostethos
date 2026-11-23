@@ -47,8 +47,6 @@ if(PHONO_BUILD_SERVER)
         src/NetworkManager.cpp
         src/main.cpp
         src/SystemController.cpp
-        src/SystemControllerCommands.cpp
-        src/SystemControllerResults.cpp
     )
     target_include_directories(phonostethos-server PRIVATE include)
     target_link_libraries(phonostethos-server PRIVATE
@@ -67,6 +65,17 @@ if(PHONO_BUILD_SERVER)
         target_link_libraries(runtime-test PRIVATE Threads::Threads
             PkgConfig::FFTW3F PkgConfig::SNDFILE)
         add_test(NAME runtime-test COMMAND runtime-test)
+        # Headless end-to-end check using ALSA null and temporary storage/LED files.
+        if(NOT CMAKE_CROSSCOMPILING)
+            find_package(Python3 QUIET COMPONENTS Interpreter)
+            if(Python3_Interpreter_FOUND)
+                add_test(NAME controller-tcp-test
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_tcp_test.py
+                        $<TARGET_FILE:phonostethos-server>)
+                set_tests_properties(controller-tcp-test PROPERTIES TIMEOUT 20)
+            endif()
+        endif()
     endif()
     install(TARGETS phonostethos-server RUNTIME DESTINATION bin)
 endif()

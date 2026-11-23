@@ -1,6 +1,7 @@
 #include "phonostethos/SystemController.h"
 
 #include <csignal>
+#include <cctype>
 #include <iostream>
 
 using namespace std;
@@ -44,18 +45,29 @@ bool parse_options(int argc, char** argv, phono_app::Options& options,
         } else if (arg == "--led-device") {
             options.led_device = value;
         } else if (arg == "--port") {
-            try {
-                size_t consumed = 0;
-                const auto port = stoul(value, &consumed);
-                if (consumed != value.size() || port == 0 || port > 65535) {
+            // Read decimal digits explicitly. Check the range after each digit
+            // so even a very long argument cannot overflow the accumulator.
+            unsigned port = 0;
+            if (value.empty()) {
+                cerr << "Missing port number\n";
+                return false;
+            }
+            for (char digit : value) {
+                if (digit < '0' || digit > '9') {
                     cerr << "Invalid port: " << value << '\n';
                     return false;
                 }
-                options.port = static_cast<uint16_t>(port);
-            } catch (const exception&) {
-                cerr << "Invalid port: " << value << '\n';
+                port = port * 10 + (digit - '0');
+                if (port > 65535) {
+                    cerr << "Invalid port: " << value << '\n';
+                    return false;
+                }
+            }
+            if (port == 0) {
+                cerr << "Port must be between 1 and 65535\n";
                 return false;
             }
+            options.port = static_cast<uint16_t>(port);
         } else {
             cerr << "Unknown option: " << arg << '\n';
             return false;
@@ -68,12 +80,19 @@ bool parse_options(int argc, char** argv, phono_app::Options& options,
 int main(int argc, char** argv) {
     phono_app::Options options;
     bool show_help = false;
-    if (!parse_options(argc, argv, options, show_help)) return show_help ? 0 : 2;
+    if (!parse_options(argc, argv, options, show_help)) {
+        if (show_help) {
+            return 0;
+        }
+        return 2;
+    }
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
     phono_app::SystemController runtime(options);
-    if (!runtime.initSystem()) return 1;
+    if (!runtime.initSystem()) {
+        return 1;
+    }
     runtime.run();
     return 0;
 }

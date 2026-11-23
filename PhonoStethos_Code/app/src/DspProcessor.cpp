@@ -9,12 +9,20 @@ using namespace std;
 namespace phono_app {
 DspProcessor::~DspProcessor() {
     if (fft_plan_ != nullptr) {
+        /* API: fftwf_destroy_plan
+         * Release the FFT plan after the audio worker has stopped using it.
+         */
         fftwf_destroy_plan(fft_plan_);
     }
 }
 
 bool DspProcessor::initialize() {
-    if (fft_plan_ != nullptr) return true;
+    if (fft_plan_ != nullptr) {
+        return true;
+    }
+    /* API: fftwf_plan_dft_r2c_1d
+     * Create a single-precision real-to-complex FFT plan using a length, input array, output array and planning flags. A 1024-point transform needs 513 complex outputs. Plan before starting workers.
+     */
     fft_plan_ = fftwf_plan_dft_r2c_1d(
         static_cast<int>(kFftFrames), fft_input_.data(), fft_output_.data(),
         FFTW_ESTIMATE);
@@ -36,7 +44,9 @@ void DspProcessor::applyBandpass(const float* input, float* output,
                                  int count, FilterMode mode) {
     const auto selected_mode = static_cast<unsigned>(mode);
     if (selected_mode != configured_mode_) {
-        const auto [low, high] = filter_limits(selected_mode);
+        double low;
+        double high;
+        filter_limits(selected_mode, low, high);
         filter_.configure(low, high, kSampleRate);
         configured_mode_ = selected_mode;
     }
@@ -46,7 +56,11 @@ void DspProcessor::applyBandpass(const float* input, float* output,
 void DspProcessor::applyGainWithLimiter(const float* input, int16_t* output,
                                        int count, float gain) {
     for (int i = 0; i < count; ++i) {
-        output[i] = static_cast<int16_t>(clamp(input[i] * gain, -32768.0F, 32767.0F));
+        float sample = input[i] * gain;
+        // PCM16 cannot store a value outside this range. Limit before conversion.
+        if (sample < -32768.0F) sample = -32768.0F;
+        if (sample > 32767.0F) sample = 32767.0F;
+        output[i] = static_cast<int16_t>(sample);
     }
 }
 
@@ -76,22 +90,32 @@ void DspProcessor::computeFFT(const int16_t* samples, float* magnitudes, int sam
         fft_input_[i] = waveform_[i] * window;
         window_sum += window;
     }
+    /* API: fftwf_execute
+     * Run the previously prepared FFT plan using the arrays supplied during planning. Window and fill input before calling it.
+     */
     fftwf_execute(fft_plan_);
 
     for (size_t bin = 0; bin < kFftBins; ++bin) {
-        magnitudes[bin] =
-            hypot(fft_output_[bin][0], fft_output_[bin][1]) / window_sum *
-            (bin == 0 ? 1.0F : 2.0F);
+        float real = fft_output_[bin][0];
+        float imaginary = fft_output_[bin][1];
+        float magnitude = hypot(real, imaginary) / window_sum;
+        // Positive-frequency bins represent both halves of a real signal's FFT.
+        // DC (bin 0) has no negative-frequency partner, so it is not doubled.
+        if (bin != 0) magnitude *= 2.0F;
+        magnitudes[bin] = magnitude;
     }
     fft_ready_ = true;
 }
 
-pair<double, double> DspProcessor::filter_limits(unsigned mode) {
-    switch (static_cast<FilterMode>(mode)) {
-        case FilterMode::Heart: return {20.0, 600.0};
-        case FilterMode::Lung: return {100.0, 1000.0};
-        case FilterMode::General:
-        default: return {20.0, 2000.0};
+// These are the three report profiles. Each edge is fourth-order Butterworth.
+void DspProcessor::filter_limits(unsigned mode, double& low, double& high) {
+    low = 20.0;
+    high = 2000.0;
+    if (mode == static_cast<unsigned>(FilterMode::Heart)) {
+        high = 600.0;
+    } else if (mode == static_cast<unsigned>(FilterMode::Lung)) {
+        low = 100.0;
+        high = 1000.0;
     }
 }
 }  // namespace phono_app

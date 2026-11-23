@@ -34,6 +34,17 @@ constexpr size_t kMaxFileListEntries = 32;
 constexpr size_t kMaxBasenameBytes = 128;
 constexpr uint8_t kProtocolVersion = 1;
 
+// SET_GAIN has an unsigned integer value and State stores the gain in one byte.
+// The original codes 1..20 already mean 1x..20x. They cannot represent 0.5/0.75/0.8.
+// We reserve unused codes 101..103 for those three choices without changing any
+// packet layout. They are identifiers, NOT amplification factors of 101x..103x.
+// gain_multiplier() below translates them to 0.5f, 0.75f and 0.8f before DSP.
+// The GUI uses the same codes but displays the actual multipliers on the slider.
+constexpr uint8_t GAIN_HALF = 101;           // 0.5x volume.
+constexpr uint8_t GAIN_THREE_QUARTERS = 102; // 0.75x volume.
+constexpr uint8_t GAIN_FOUR_FIFTHS = 103;    // 0.8x volume.
+
+
 enum class Command : uint8_t {
     SetMode = 1,
     SetGain = 2,
@@ -165,6 +176,8 @@ inline void append_u32_be(vector<uint8_t>& out,
     out.push_back(static_cast<uint8_t>(value));
 }
 
+// Read the IEEE-754 bit pattern without converting the integer numerically.
+// memcpy copies the bits safely; a float pointer cast would not do that reliably.
 inline float read_float_be(const uint8_t* bytes) {
     static_assert(sizeof(float) == 4 && numeric_limits<float>::is_iec559,
                   "protocol requires IEEE-754 binary32");
@@ -200,15 +213,18 @@ inline bool decode_command(const uint8_t* bytes, size_t size,
 
 // Keep the existing integer wire values and reserve three codes for attenuation.
 inline constexpr bool valid_gain_code(uint32_t code) {
-    return (code >= 1 && code <= 20) || (code >= 101 && code <= 103);
+    return (code >= 1 && code <= 20) || code == GAIN_HALF ||
+           code == GAIN_THREE_QUARTERS || code == GAIN_FOUR_FIFTHS;
 }
 
 inline constexpr float gain_multiplier(uint32_t code) {
     switch (code) {
-        case 101: return 0.5F;
-        case 102: return 0.75F;
-        case 103: return 0.8F;
-        default: return valid_gain_code(code) ? static_cast<float>(code) : 1.0F;
+        case GAIN_HALF: return 0.5F;
+        case GAIN_THREE_QUARTERS: return 0.75F;
+        case GAIN_FOUR_FIFTHS: return 0.8F;
+        default:
+            if (valid_gain_code(code)) return static_cast<float>(code);
+            return 1.0F;
     }
 }
 
@@ -400,6 +416,20 @@ private:
     bool failed_ = false;
 };
 
+// Parse a decimal protocol ID without exceptions or temporary integer types.
+// Test before multiplying so a hostile long number cannot overflow uint32_t.
+inline bool parse_decimal_id(const string& text, uint32_t& value) {
+    if (text.empty()) return false;
+    value = 0;
+    for (char character : text) {
+        if (character < '0' || character > '9') return false;
+        unsigned digit = character - '0';
+        if (value > (UINT32_MAX - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    return true;
+}
+
 inline bool parse_file_list(const vector<uint8_t>& payload,
                             FileList& result) {
     if (payload.size() > kMaxFileListPayloadBytes) return false;
@@ -410,25 +440,8 @@ inline bool parse_file_list(const vector<uint8_t>& payload,
         text.compare(0, 12, "next_cursor=") != 0) {
         return false;
     }
-    try {
-        const auto cursor_text = text.substr(12, first_newline - 12);
-        if (cursor_text.empty() ||
-            !all_of(cursor_text.begin(), cursor_text.end(),
-                         [](unsigned char digit) {
-                             return digit >= '0' && digit <= '9';
-                         })) {
-            return false;
-        }
-        size_t consumed = 0;
-        const auto cursor = stoull(cursor_text, &consumed);
-        if (consumed != cursor_text.size() ||
-            cursor > numeric_limits<uint32_t>::max()) {
-            return false;
-        }
-        result.next_cursor = static_cast<uint32_t>(cursor);
-    } catch (const exception&) {
-        return false;
-    }
+    string cursor_text = text.substr(12, first_newline - 12);
+    if (!parse_decimal_id(cursor_text, result.next_cursor)) return false;
 
     result.entries.clear();
     vector<uint32_t> seen_ids;
@@ -439,25 +452,8 @@ inline bool parse_file_list(const vector<uint8_t>& payload,
         const auto tab = text.find('\t', start);
         if (tab == string::npos || tab >= end) return false;
         uint32_t id = 0;
-        try {
-            const auto id_text = text.substr(start, tab - start);
-            if (id_text.empty() ||
-                !all_of(id_text.begin(), id_text.end(),
-                             [](unsigned char digit) {
-                                 return digit >= '0' && digit <= '9';
-                             })) {
-                return false;
-            }
-            size_t consumed = 0;
-            const auto parsed = stoull(id_text, &consumed);
-            if (parsed == 0 || consumed != id_text.size() ||
-                parsed > numeric_limits<uint32_t>::max()) {
-                return false;
-            }
-            id = static_cast<uint32_t>(parsed);
-        } catch (const exception&) {
-            return false;
-        }
+        string id_text = text.substr(start, tab - start);
+        if (!parse_decimal_id(id_text, id) || id == 0) return false;
         const auto name = text.substr(tab + 1, end - tab - 1);
         if (name.empty() || name.size() > kMaxBasenameBytes ||
             name.find_first_of("\t\r/\\") != string::npos ||

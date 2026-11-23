@@ -1,189 +1,182 @@
-// One character device accepts a complete four-LED mask from th_Main.
-// GPIO descriptors come from phonostethos-status-leds-overlay.dts.
-#include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/gpio/consumer.h>
-#include <linux/jiffies.h>
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/uaccess.h>
-#include <linux/workqueue.h>
+// Raspberry Pi 4 LED driver, following the classroom character-device example.
+#include <linux/cdev.h>      // Character-device registration.
+#include <linux/device.h>    // Device class and /dev node.
+#include <linux/fs.h>        // struct file and file_operations.
+#include <linux/io.h>        // ioremap, readl and writel.
+#include <linux/module.h>    // Module load and unload.
+#include <linux/mutex.h>     // Prevent simultaneous mask writes.
+#include <linux/uaccess.h>   // Copy data safely from a user process.
 
 #define DEVICE_NAME "phonostethos_leds"
-#define LED_ALL 0x0f
-#define ERROR_PULSE 0xff
+#define CLASS_NAME "phonostethos"
+#define GPIO_BASE 0xFE200000 // BCM2711 GPIO base on Raspberry Pi 4.
 
-struct phonostethos_leds {
-	struct gpio_desc *gpio[4]; // HEART, LUNG, GENERAL, RECORDING: bits 0..3.
-	dev_t devt;
-	struct cdev cdev;
-	struct class *class;
-	struct device *device;
-	struct mutex lock;
-	struct delayed_work error_pulse_work;
-	u8 cached_mask;
-	bool available;
+// The layout matches the GPIO registers used in the professor's utils.h.
+struct GpioRegisters {
+    u32 GPFSEL[6]; // Three function bits per pin, ten pins per register.
+    u32 reserved1;
+    u32 GPSET[2];  // Write a 1 to make the selected output high.
+    u32 reserved2;
+    u32 GPCLR[2];  // Write a 1 to make the selected output low.
 };
 
-static struct phonostethos_leds leds = {
-	.lock = __MUTEX_INITIALIZER(leds.lock),
-};
+static struct GpioRegisters __iomem *gpio;
+static dev_t device_number;
+static struct cdev led_cdev;
+static struct class *led_class;
+static const unsigned int led_pins[4] = {17, 27, 24, 22};
+static DEFINE_MUTEX(led_lock); // Serialize write() calls.
+
+// Same calculation as SetGPIOFunction in the lecture.
+static void set_gpio_function(unsigned int pin, unsigned int function)
+{
+    unsigned int register_index = pin / 10;
+    unsigned int shift = (pin % 10) * 3;
+
+    /* API: readl(address) and writel(value, address)
+     * Read or write one 32-bit hardware register through its mapped address.
+     * Clear only this pin's three function bits, then insert its new function.
+     */
+    u32 value = readl(&gpio->GPFSEL[register_index]);
+    value = value & ~(7U << shift);
+    value = value | (function << shift);
+    writel(value, &gpio->GPFSEL[register_index]);
+}
 
 static void set_led_mask(u8 mask)
 {
-	unsigned int index;
-
-	// Descriptor polarity comes from GPIO_ACTIVE_HIGH in the overlay.
-	for (index = 0; index < ARRAY_SIZE(leds.gpio); ++index)
-		gpiod_set_value_cansleep(leds.gpio[index], !!(mask & BIT(index)));
+    unsigned int index;
+    for (index = 0; index < 4; index++) {
+        unsigned int pin = led_pins[index];
+        unsigned int gpio_bit = 1U << pin; // All selected pins are below GPIO32.
+        if (mask & (1U << index)) {
+            writel(gpio_bit, &gpio->GPSET[0]);
+        } else {
+            writel(gpio_bit, &gpio->GPCLR[0]);
+        }
+    }
 }
 
-static void restore_led_mask(struct work_struct *work)
+// open() connects this file handle with the mapped GPIO registers.
+static int led_open(struct inode *inode, struct file *file)
 {
-	mutex_lock(&leds.lock);
-	if (leds.available)
-		set_led_mask(leds.cached_mask);
-	mutex_unlock(&leds.lock);
+    file->private_data = gpio;
+    return 0;
 }
 
-static int phonostethos_leds_open(struct inode *inode, struct file *file)
+static int led_release(struct inode *inode, struct file *file)
 {
-	file->private_data = container_of(inode->i_cdev, struct phonostethos_leds, cdev);
-	return 0;
+    file->private_data = NULL;
+    return 0;
 }
 
-static int phonostethos_leds_release(struct inode *inode, struct file *file)
+static ssize_t led_write(struct file *file, const char __user *buffer,
+                         size_t length, loff_t *offset)
 {
-	return 0;
+    u8 mask;
+    if (file->private_data == NULL) return -ENODEV;
+    if (length != 1) return -EINVAL;
+
+    /* API: copy_from_user(destination, user_address, byte_count)
+     * The user buffer belongs to a process. Copy its single binary byte into
+     * the kernel. A nonzero return means the copy failed.
+     */
+    if (copy_from_user(&mask, buffer, 1) != 0) return -EFAULT;
+    if (mask > 0x0F) return -EINVAL; // Only four LED bits are defined.
+
+    /* API: mutex_lock / mutex_unlock
+     * Only one caller can change the complete LED mask at a time.
+     */
+    mutex_lock(&led_lock);
+    set_led_mask(mask);
+    mutex_unlock(&led_lock);
+    return 1; // One byte was accepted.
 }
 
-static ssize_t phonostethos_leds_write(struct file *file,
-		const char __user *buffer, size_t length, loff_t *offset)
-{
-	struct phonostethos_leds *device = file->private_data;
-	u8 command;
-
-	if (length != sizeof(command))
-		return -EINVAL;
-	if (copy_from_user(&command, buffer, sizeof(command)))
-		return -EFAULT;
-	if (command != ERROR_PULSE && (command & ~LED_ALL))
-		return -EINVAL;
-
-	// Do not wait for work while holding the mutex that the work also needs.
-	if (command != ERROR_PULSE)
-		cancel_delayed_work_sync(&device->error_pulse_work);
-	if (mutex_lock_interruptible(&device->lock))
-		return -ERESTARTSYS;
-	if (!device->available) {
-		mutex_unlock(&device->lock);
-		return -ENODEV;
-	}
-	if (command == ERROR_PULSE) {
-		set_led_mask(LED_ALL);
-		mod_delayed_work(system_wq, &device->error_pulse_work, msecs_to_jiffies(100));
-	} else {
-		device->cached_mask = command;
-		set_led_mask(command);
-	}
-	mutex_unlock(&device->lock);
-	return sizeof(command);
-}
-
-static const struct file_operations phonostethos_leds_fops = {
-	.owner = THIS_MODULE,
-	.open = phonostethos_leds_open,
-	.release = phonostethos_leds_release,
-	.write = phonostethos_leds_write,
-	.llseek = noop_llseek,
+// These callbacks have the signatures required by the Linux kernel.
+static const struct file_operations led_operations = {
+    .owner = THIS_MODULE,
+    .open = led_open,
+    .release = led_release,
+    .write = led_write,
+    .llseek = noop_llseek,
 };
 
-static int phonostethos_leds_probe(struct platform_device *platform)
+static int __init led_init(void)
 {
-	static const char * const names[] = { "heart", "lung", "general", "recording" };
-	unsigned int index;
-	int ret;
+    int result;
+    unsigned int index;
+    struct device *device;
 
-	if (leds.device)
-		return -EBUSY;
-	// devm_ releases each descriptor if probe fails or the device is removed.
-	for (index = 0; index < ARRAY_SIZE(names); ++index) {
-		leds.gpio[index] = devm_gpiod_get(&platform->dev, names[index], GPIOD_OUT_LOW);
-		if (IS_ERR(leds.gpio[index]))
-			return dev_err_probe(&platform->dev, PTR_ERR(leds.gpio[index]),
-					     "Cannot acquire %s GPIO\n", names[index]);
-	}
-	INIT_DELAYED_WORK(&leds.error_pulse_work, restore_led_mask);
-	leds.cached_mask = 0;
-	ret = alloc_chrdev_region(&leds.devt, 0, 1, DEVICE_NAME);
-	if (ret)
-		return ret;
-	cdev_init(&leds.cdev, &phonostethos_leds_fops);
-	leds.cdev.owner = THIS_MODULE;
-	ret = cdev_add(&leds.cdev, leds.devt, 1);
-	if (ret)
-		goto err_unregister;
-	leds.class = class_create("phonostethos");
-	if (IS_ERR(leds.class)) {
-		ret = PTR_ERR(leds.class);
-		goto err_cdev;
-	}
-	mutex_lock(&leds.lock);
-	leds.available = true;
-	mutex_unlock(&leds.lock);
-	leds.device = device_create(leds.class, &platform->dev, leds.devt, NULL, DEVICE_NAME);
-	if (IS_ERR(leds.device)) {
-		ret = PTR_ERR(leds.device);
-		leds.device = NULL;
-		mutex_lock(&leds.lock);
-		leds.available = false;
-		mutex_unlock(&leds.lock);
-		class_destroy(leds.class);
-		goto err_cdev;
-	}
-	platform_set_drvdata(platform, &leds);
-	dev_info(&platform->dev, "Registered /dev/%s using GPIO descriptors\n", DEVICE_NAME);
-	return 0;
+    /* API: ioremap(physical_address, byte_count)
+     * Map the GPIO registers so the kernel can access them. NULL means failure.
+     */
+    gpio = ioremap(GPIO_BASE, sizeof(struct GpioRegisters));
+    if (gpio == NULL) return -ENOMEM;
+    set_led_mask(0);
+    for (index = 0; index < 4; index++) {
+        set_gpio_function(led_pins[index], 1); // 001 selects GPIO output.
+    }
 
-err_cdev:
-	cdev_del(&leds.cdev);
-err_unregister:
-	unregister_chrdev_region(leds.devt, 1);
-	return ret;
+    /* API: alloc_chrdev_region / cdev_init / cdev_add
+     * Reserve a major/minor number, attach our callbacks, then register them.
+     * A failed step jumps to cleanup for the steps that already succeeded.
+     */
+    result = alloc_chrdev_region(&device_number, 0, 1, DEVICE_NAME);
+    if (result < 0) goto error_gpio;
+    cdev_init(&led_cdev, &led_operations);
+    result = cdev_add(&led_cdev, device_number, 1);
+    if (result < 0) goto error_number;
+
+    /* API: class_create / device_create
+     * Publish the class and character device. devtmpfs/udev creates its node.
+     * Our kernel uses class_create(name), unlike the older lecture kernel.
+     */
+    led_class = class_create(CLASS_NAME);
+    if (IS_ERR(led_class)) {
+        result = PTR_ERR(led_class);
+        goto error_cdev;
+    }
+    device = device_create(led_class, NULL, device_number, NULL, DEVICE_NAME);
+    if (IS_ERR(device)) {
+        result = PTR_ERR(device);
+        goto error_class;
+    }
+    pr_info("PhonoStethos: registered /dev/%s\n", DEVICE_NAME);
+    return 0;
+
+error_class:
+    class_destroy(led_class);
+error_cdev:
+    cdev_del(&led_cdev);
+error_number:
+    unregister_chrdev_region(device_number, 1);
+error_gpio:
+    set_led_mask(0);
+    for (index = 0; index < 4; index++) set_gpio_function(led_pins[index], 0);
+    iounmap(gpio);
+    return result;
 }
 
-static void phonostethos_leds_remove(struct platform_device *platform)
+static void __exit led_exit(void)
 {
-	mutex_lock(&leds.lock);
-	leds.available = false;
-	set_led_mask(0);
-	mutex_unlock(&leds.lock);
-	cancel_delayed_work_sync(&leds.error_pulse_work);
-	device_destroy(leds.class, leds.devt);
-	class_destroy(leds.class);
-	cdev_del(&leds.cdev);
-	unregister_chrdev_region(leds.devt, 1);
-	leds.device = NULL;
+    unsigned int index;
+    // Reverse registration, turn LEDs off and return the pins to input.
+    device_destroy(led_class, device_number);
+    cdev_del(&led_cdev);
+    class_destroy(led_class);
+    unregister_chrdev_region(device_number, 1);
+    set_led_mask(0);
+    for (index = 0; index < 4; index++) set_gpio_function(led_pins[index], 0);
+
+    /* API: iounmap(mapped_address)
+     * Release the kernel mapping after the final GPIO access.
+     */
+    iounmap(gpio);
 }
 
-static const struct of_device_id phonostethos_leds_matches[] = {
-	{ .compatible = "phonostethos,status-leds" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, phonostethos_leds_matches);
-
-static struct platform_driver phonostethos_leds_driver = {
-	.probe = phonostethos_leds_probe,
-	.remove = phonostethos_leds_remove,
-	.driver = {
-		.name = "phonostethos-status-leds",
-		.of_match_table = phonostethos_leds_matches,
-	},
-};
-module_platform_driver(phonostethos_leds_driver);
-MODULE_DESCRIPTION("PhonoStethos GPIO-descriptor status LED driver");
-MODULE_AUTHOR("PhonoStethos");
+module_init(led_init);
+module_exit(led_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Raspberry Pi 4 four-LED mask character driver");
+MODULE_AUTHOR("PhonoStethos");

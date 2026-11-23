@@ -77,6 +77,9 @@ public:
             if (closed_) return false;
             queue_.push_back(move(message));
         }
+        /* API: pthread_cond_signal
+         * Wake one thread waiting on this condition variable. Change the protected condition under its mutex first. The signal itself does not store data.
+         */
         pthread_cond_signal(&available_);
         return true;
     }
@@ -86,6 +89,9 @@ public:
         PthreadLock lock(mutex_);
         const auto deadline = waitDeadline(timeout.count());
         while (!closed_ && queue_.empty()) {
+            /* API: pthread_cond_timedwait
+             * Sleep until signalled or until an absolute timespec deadline. The mutex must already be held. The call releases it while sleeping and reacquires it before returning. Recheck the predicate after waking.
+             */
             const int result = pthread_cond_timedwait(
                 &available_, &mutex_, &deadline);
             if (result == ETIMEDOUT) return false;
@@ -102,6 +108,9 @@ public:
             PthreadLock lock(mutex_);
             closed_ = true;
         }
+        /* API: pthread_cond_broadcast
+         * Wake all waiters so each can recheck the protected stop/data condition.
+         */
         pthread_cond_broadcast(&available_);
     }
 

@@ -43,12 +43,11 @@ the configured Buildroot toolchain and kernel tree.
 
 ## Kernel driver
 
-The driver source is `kernel-driver/phonostethos_leds.c`. It creates
-`/dev/phonostethos_leds` after probing the `phonostethos,status-leds` Device Tree
-node. It uses the kernel GPIO descriptor (`gpiod`) interface. The LED mask is
-HEART `0x01` / BCM17, LUNG `0x02` / BCM27, GENERAL `0x04` / BCM24, and recording
-`0x08` / BCM22. Enable `dtoverlay=phonostethos-status-leds` in the target firmware
-configuration; the overlay is required by this driver.
+The driver source is `kernel-driver/phonostethos_leds.c`. It directly maps the
+Raspberry Pi 4 GPIO register block at physical address `0xFE200000` and creates
+`/dev/phonostethos_leds`. The LED mask is HEART `0x01` / BCM17, LUNG `0x02` /
+BCM27, GENERAL `0x04` / BCM24, and recording `0x08` / BCM22. No Device Tree LED
+overlay is required.
 
 Build it against the exact target kernel headers with:
 
@@ -57,10 +56,10 @@ make -C kernel-driver KDIR=/path/to/linux \
   CROSS_COMPILE=/path/to/toolchain/bin/aarch64-linux- ARCH=arm64
 ```
 
-The root `Makefile` stages the kernel module, GPIO overlay, udev permissions and
-init script. The udev rule uses the `phonostethos` group; the Buildroot users-table
+The root `Makefile` stages the kernel module, udev permissions and init script.
+The udev rule uses the `phonostethos` group; the Buildroot users-table
 input is supplied in `kernel-driver/deploy/users.txt`. See the deployment guide
-for the firmware config line and exact staging paths.
+for module installation and staging paths.
 
 The server stores recordings on the drive mounted at `/media/usb_storage`.
 The Buildroot overlay installs an eudev rule to mount USB FAT32

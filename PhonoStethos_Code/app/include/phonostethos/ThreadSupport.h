@@ -2,13 +2,19 @@
 
 #include <cerrno>
 #include <pthread.h>
-#include <system_error>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <time.h>
 
 namespace phono_app {
 // pthread functions return the error number themselves (not through errno).
 inline void checkPthread(int error) {
-    if (error != 0) throw std::system_error(error, std::generic_category());
+    if (error != 0) {
+        // Startup cannot continue with an uninitialized mutex or condition variable.
+        std::fprintf(stderr, "pthread: %s\n", std::strerror(error));
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 inline void initializeMutex(pthread_mutex_t& mutex) {
@@ -19,8 +25,10 @@ inline void initializeCondition(pthread_cond_t& condition) {
     pthread_condattr_t attributes;
     checkPthread(pthread_condattr_init(&attributes));
     const int clock_error = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
-    const int init_error = clock_error == 0
-        ? pthread_cond_init(&condition, &attributes) : clock_error;
+    int init_error = clock_error;
+    if (clock_error == 0) {
+        init_error = pthread_cond_init(&condition, &attributes);
+    }
     pthread_condattr_destroy(&attributes);
     checkPthread(init_error);
 }
@@ -43,8 +51,14 @@ inline timespec waitDeadline(long milliseconds) {
 class PthreadLock {
 public:
     explicit PthreadLock(pthread_mutex_t& mutex) : mutex_(mutex) {
+        /* API: pthread_mutex_lock
+         * Lock the mutex before reading or changing the associated shared data. Pair it with unlock after the protected work. Pthread errors are returned directly.
+         */
         checkPthread(pthread_mutex_lock(&mutex_));
     }
+    /* API: pthread_mutex_unlock
+     * Release the mutex so another thread can use the shared object. The caller must own the mutex.
+     */
     ~PthreadLock() { pthread_mutex_unlock(&mutex_); }
     PthreadLock(const PthreadLock&) = delete;
     PthreadLock& operator=(const PthreadLock&) = delete;

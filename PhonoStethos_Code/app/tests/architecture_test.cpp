@@ -8,16 +8,16 @@
 using namespace std;
 
 int main() {
-    phono_app::CircularBuffer<int, 3> buffer;
-    const array<int, 1> rejected{0};
+    phono_app::CircularBuffer buffer{3};
+    const array<int16_t, 1> rejected{0};
     assert(!buffer.push(rejected.data(), rejected.size()));
     assert(buffer.begin_session());
-    const array<int, 3> input{1, 2, 3};
+    const array<int16_t, 3> input{1, 2, 3};
     assert(buffer.push(input.data(), input.size()));
     assert(!buffer.begin_session());
     assert(!buffer.push(input.data(), 1));
     buffer.stop_producing();
-    array<int, 3> ordered{};
+    array<int16_t, 3> ordered{};
     assert(buffer.pop(ordered.data(), ordered.size()) == ordered.size());
     assert((ordered == input));
     assert(buffer.isEmpty());
@@ -51,9 +51,10 @@ int main() {
     latest.waveform[0] = 2.0F;
     assert(data.try_enqueue(first));
     assert(data.try_enqueue(latest));
-    const auto consumed = data.try_dequeue();
-    assert(consumed.has_value() && consumed->waveform[0] == 2.0F);
+    phono_app::Telemetry consumed;
+    assert(data.try_dequeue(consumed));
+    assert(consumed.waveform[0] == 2.0F);
     data.set_connected(false);
     assert(!data.try_enqueue(first));
-    assert(!data.try_dequeue().has_value());
+    assert(!data.try_dequeue(consumed));
 }

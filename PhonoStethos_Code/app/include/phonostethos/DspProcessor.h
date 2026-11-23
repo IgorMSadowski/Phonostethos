@@ -8,8 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
-#include <utility>
 
 using namespace std;
 
@@ -31,7 +29,7 @@ public:
     const array<float, kFftFrames>& waveform() const { return waveform_; }
 
 private:
-    static pair<double, double> filter_limits(unsigned mode);
+    static void filter_limits(unsigned mode, double& low, double& high);
 
     array<float, kFftFrames> history_{};
     size_t history_next_ = 0;

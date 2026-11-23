@@ -50,6 +50,7 @@ public:
 private:
     void run();
     void serve_client(int socket_fd);
+    bool send_next_frame(int socket_fd);
     void set_network_thread_policy();
     bool send_all(int socket_fd, const vector<uint8_t>& frame);
     void post_network_event(WorkerResultCode code, uint8_t error = 0);

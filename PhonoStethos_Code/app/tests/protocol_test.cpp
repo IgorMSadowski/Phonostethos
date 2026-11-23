@@ -10,6 +10,14 @@
 using namespace std;
 
 int main() {
+    uint32_t parsed_id = 0;
+    if (!phono::protocol::parse_decimal_id("4294967295", parsed_id) ||
+        parsed_id != UINT32_MAX) return 30;
+    if (phono::protocol::parse_decimal_id("4294967296", parsed_id) ||
+        phono::protocol::parse_decimal_id("999999999999999999999999", parsed_id) ||
+        phono::protocol::parse_decimal_id("-1", parsed_id) ||
+        phono::protocol::parse_decimal_id("", parsed_id)) return 31;
+
     using namespace phono::protocol;
 
     const uint8_t length_bytes[] = {0, 0, 0x18, 0};

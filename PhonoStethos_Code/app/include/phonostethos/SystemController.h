@@ -10,9 +10,7 @@
 #include "phonostethos/RuntimeTypes.h"
 
 #include <map>
-#include <memory>
 #include "phonostethos/ThreadSupport.h"
-#include <optional>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -82,6 +80,10 @@ private:
     void processMessage(const MainMessage& message);
     void processCommand(const phono::protocol::CommandPacket& command);
     void handleWorkerResult(const MainMessage& message);
+    bool handle_notification(const MainMessage& message);
+    void handle_operation_error(const MainMessage& message);
+    void handle_recording_result(const MainMessage& message);
+    void handle_playback_result(const MainMessage& message);
     void complete_operation(bool success, uint8_t error_code = 0);
     void publish_status();
     void publish_state();
@@ -121,15 +123,15 @@ private:
     atomic<bool> audio_init_complete_{false};
     uint8_t storage_flags_ = 0;
     pthread_mutex_t configuration_mutex_{};
-    CircularBuffer<int16_t, kCircularBufferSamples> recording_buffer_;
-    CircularBuffer<int16_t, kCircularBufferSamples> playback_buffer_;
+    CircularBuffer recording_buffer_;
+    CircularBuffer playback_buffer_;
     CommandQueue command_queue_;
     DataQueue data_queue_;
     LedDriver led_driver_;
     FileIoManager writer_;
     // Destruction is in reverse order: AudioDSP joins before the FFT plan is destroyed.
     DspProcessor dsp_processor_;
-    unique_ptr<AudioEngine> audio_;
+    AudioEngine audio_;
     NetworkManager network_;
     map<uint32_t, ArchiveIdentity> archive_by_id_;
     map<string, uint32_t> archive_id_by_name_;
@@ -137,14 +139,17 @@ private:
     uint32_t next_file_id_ = 1;
     uint32_t next_session_id_ = 1;
     uint32_t next_operation_id_ = 1;
-    optional<PendingOperation> pending_;
+    PendingOperation pending_{};
+    bool has_pending_operation_ = false; // Mark pending operation as empty.
     bool initialized_ = false;
     bool stopping_ = false;
     chrono::steady_clock::time_point next_storage_check_{};
     udev* udev_context_ = nullptr;
     udev_monitor* udev_monitor_ = nullptr;
     int udev_fd_ = -1;
-    optional<FileIoManager::Request> deferred_operation_request_;
-    optional<FileIoManager::Request> deferred_storage_request_;
+    FileIoManager::Request deferred_operation_request_{};
+    bool has_deferred_operation_ = false; // Mark deferred operation as empty.
+    FileIoManager::Request deferred_storage_request_{};
+    bool has_deferred_storage_ = false; // Mark deferred storage as empty.
 };
 }  // namespace phono_app

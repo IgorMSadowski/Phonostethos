@@ -3,7 +3,6 @@
 #include "phonostethos/RuntimeTypes.h"
 
 #include "phonostethos/ThreadSupport.h"
-#include <optional>
 #include <utility>
 
 using namespace std;
@@ -20,36 +19,47 @@ public:
     void set_connected(bool connected) {
         PthreadLock lock(mutex_);
         connected_ = connected;
-        if (!connected_) packet_.reset();
+        if (!connected_) has_packet_ = false;
     }
 
     bool try_enqueue(const Telemetry& packet) {
+        /* API: pthread_mutex_trylock
+         * Try once to take the mutex. A nonzero result means it was not acquired. Audio telemetry can be skipped instead of blocking audio.
+         */
         if (pthread_mutex_trylock(&mutex_) != 0) return false;
         if (!connected_) {
+            /* API: pthread_mutex_unlock
+             * Release the mutex so another thread can use the shared object. The caller must own the mutex.
+             */
             pthread_mutex_unlock(&mutex_);
             return false;
         }
         packet_ = packet;
+        has_packet_ = true; // Mark packet as available.
         pthread_mutex_unlock(&mutex_);
         return true;
     }
 
-    optional<Telemetry> try_dequeue() {
-        if (pthread_mutex_trylock(&mutex_) != 0) return nullopt;
-        auto packet = move(packet_);
-        packet_.reset();
+    bool try_dequeue(Telemetry& packet) {
+        if (pthread_mutex_trylock(&mutex_) != 0) return false;
+        bool available = has_packet_;
+        if (available) {
+            packet = packet_;
+            has_packet_ = false; // Mark packet as empty.
+        }
         pthread_mutex_unlock(&mutex_);
-        return packet;
+        return available;
     }
 
     void clear() {
         PthreadLock lock(mutex_);
-        packet_.reset();
+        has_packet_ = false; // Mark packet as empty.
     }
 
 private:
     pthread_mutex_t mutex_{};
-    optional<Telemetry> packet_;
+    Telemetry packet_{};
+    bool has_packet_ = false; // Mark packet as empty.
     bool connected_ = false;
 };
 }  // namespace phono_app

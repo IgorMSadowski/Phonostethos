@@ -10,7 +10,7 @@ using namespace phono_app;
 
 namespace {
 struct Transfer {
-    CircularBuffer<int, 31> buffer;
+    CircularBuffer buffer{31};
     size_t received = 0;
 };
 
@@ -18,7 +18,7 @@ struct Transfer {
 void* produce(void* context) {
     auto& transfer = *static_cast<Transfer*>(context);
     for (int block = 0; block < 1000; ++block) {
-        std::array<int, 15> samples{};
+        std::array<int16_t, 15> samples{};
         for (int i = 0; i < 15; ++i) samples[i] = block * 15 + i;
         while (!transfer.buffer.push(samples.data(), samples.size())) {
             const timespec pause{0, 100000};
@@ -31,7 +31,7 @@ void* produce(void* context) {
 
 void* consume(void* context) {
     auto& transfer = *static_cast<Transfer*>(context);
-    std::array<int, 7> samples{};
+    std::array<int16_t, 7> samples{};
     while (true) {
         const auto count = transfer.buffer.pop(samples.data(), samples.size());
         for (size_t i = 0; i < count; ++i) {
@@ -71,7 +71,7 @@ int main() {
     assert(pthread_join(producer, nullptr) == 0);
     assert(pthread_join(consumer, nullptr) == 0);
     assert(transfer.received == 15000);
-    int sample = 42;
+    int16_t sample = 42;
     assert(!transfer.buffer.push(&sample, 1)); // STOP forbids later pushes.
     assert(transfer.buffer.begin_session());
     assert(transfer.buffer.isEmpty()); // The next session inherits no samples.

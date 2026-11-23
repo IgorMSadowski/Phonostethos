@@ -21,22 +21,13 @@ make driver
 
 The server is C++17 and uses direct pthread APIs for execution and synchronization. `find_package(Threads)` supplies the platform threading link options.
 
-## GPIO descriptor driver: required boot overlay
+## Simple direct-register LED driver
 
-The LED module now acquires named GPIO descriptors from Device Tree. The existing overlay maps HEART=17, LUNG=27, GENERAL=24 and RECORDING=22, active high. The old raw-register driver did not need this overlay; the new descriptor driver does.
+The LED module maps the Raspberry Pi 4 BCM2711 GPIO register block at physical address `0xFE200000` using `ioremap`, then configures BCM17, BCM27, BCM24 and BCM22 as outputs. It creates `/dev/phonostethos_leds`; no GPIO overlay or `config.txt` change is needed. This fixed address is specific to the Raspberry Pi 4 and will not work unchanged on a Raspberry Pi 5 or a different board.
 
-`make driver` builds both the module and `kernel-driver/build/phonostethos-status-leds.dtbo`. `make install` stages the module and overlay using the configured Makefile paths. By default, BOOT_DIR is Buildroot's `output/images/rpi-firmware`; OVERLAY_DIR is its `output/target` root-filesystem tree. These are image staging paths, not an automatic deployment to the Pi.
+Build the module against the exact kernel that will run it, install or copy `phonostethos_leds.ko` to the Pi, then load it with `insmod`. Check `dmesg` and `/dev/phonostethos_leds`. The application writes one byte containing the full LED mask; for a manual test, `printf '\005' > /dev/phonostethos_leds` turns on Heart and General, and `printf '\000' > /dev/phonostethos_leds` turns all LEDs off.
 
-For the target firmware partition:
-
-1. Put `phonostethos-status-leds.dtbo` in its `overlays/` directory.
-2. Add `dtoverlay=phonostethos-status-leds` to the applicable Raspberry Pi firmware `config.txt` section.
-3. Install the matching `phonostethos_leds.ko` for the exact running kernel.
-4. Rebuild/deploy the image or transfer the corresponding boot/rootfs files using your normal deployment procedure, then reboot.
-
-With Buildroot, keep the overlay and config line in your board configuration/post-build process so a later image rebuild retains them. The project does not edit your external Buildroot configuration automatically.
-
-The kernel must include GPIOLIB, Device Tree and the Pi GPIO controller. The supplied Buildroot kernel has these enabled and the revised module was compiled against that kernel.
+This educational driver accesses hardware registers directly rather than using the kernel GPIO subsystem. Do not use another driver or program to control these same GPIO pins at the same time.
 
 ## Device permissions and service startup
 
@@ -50,13 +41,11 @@ After boot, inspect logs and `/dev/phonostethos_leds`. The dashboard should repo
 
 The existing filter cascade and listening profiles were retained. Some return types include success/failure and runtime helper methods in addition to the representative class-diagram labels. WAV filename collision retry, GUI acknowledgement details and other report observations outside the requested pthread/class/FFTW/LED work are not claimed to have all been redesigned by this revision.
 
-## Checks performed during this revision
+## Checks performed in the previous application revision
 
 - Full server cross-build with the project's aarch64 Buildroot SDK: passed.
-- GPIO descriptor kernel module build against the configured target kernel: passed.
-- Device-tree overlay preprocessing/compilation: passed.
-- Five native tests: filter profiles, protocol, architecture utilities, concurrent pthread synchronization, and DSP/WAV/LED-command integration: passed.
-- Native server TCP check using ALSA null devices: partial/coalesced commands, ordered control results, reconnect state, invalid argument rejection and archive listing: passed.
+- Previous GPIO-descriptor module build and Device Tree overlay build: passed; these were replaced by the direct-register driver.
+- Five native tests and a native server TCP check: passed.
 - Startup script syntax and diff whitespace checks: passed.
 
 The native runtime check uses the system's shared libraries and copies of the matching development headers in the chat workspace. The TCP check uses temporary storage and a temporary regular file in place of the LED device. Its FIFO scheduling requests were denied by the host, as expected without real-time privileges; the target scheduling configuration must be verified on the Pi. No test result here asserts real microphone/headphone performance, physical LED illumination or on-Pi timing.

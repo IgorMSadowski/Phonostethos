@@ -1,30 +1,22 @@
 #pragma once
 
-#include "phonostethos/RuntimeTypes.h"
-
-using namespace std;
+#include <cstdint>
+#include <string>
 
 namespace phono_app {
 class LedDriver {
 public:
-    explicit LedDriver(const string& path);
+    explicit LedDriver(const std::string& path);
 
     bool openDriver();
-
-    bool writeByte(uint8_t command);
-
-    bool setModeLed(FilterMode mode);
-    bool setRecordLed(bool recording);
-    bool triggerErrorPulse();
+    bool writeByte(std::uint8_t mask);
 
     void closeDriver();
 
     ~LedDriver();
 
 private:
-    string path_;
+    std::string path_;
     int fd_ = -1;
-    bool available_ = false;
-    uint8_t cached_mask_ = 0;
 };
 }  // namespace phono_app

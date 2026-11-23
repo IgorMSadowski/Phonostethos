@@ -38,6 +38,24 @@ void main() {
     expect(message.recordingOverruns, 2);
   });
 
+  test('state accepts all supported gain codes and rejects unknown codes', () {
+    final validCodes = [1, 10, 11, 20, 101, 102, 103];
+    for (final code in validCodes) {
+      final payload = Uint8List(20);
+      payload[0] = 1; // Protocol version.
+      payload[3] = code;
+      final messages = FrameDecoder().add(_frame(stateType, payload));
+      expect((messages.single as StateMessage).gain, code);
+    }
+    final invalidPayload = Uint8List(20);
+    invalidPayload[0] = 1;
+    invalidPayload[3] = 21;
+    expect(
+      () => FrameDecoder().add(_frame(stateType, invalidPayload)),
+      throwsFormatException,
+    );
+  });
+
   test('file lists retain opaque server file IDs', () {
     const text = 'next_cursor=91\n44\tHEART_20261101_143022_000001.wav\n';
     final decoder = FrameDecoder();

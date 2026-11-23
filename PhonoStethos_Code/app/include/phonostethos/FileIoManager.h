@@ -6,7 +6,6 @@
 
 #include <deque>
 #include "phonostethos/ThreadSupport.h"
-#include <optional>
 
 #include <sndfile.h>
 
@@ -29,6 +28,8 @@ public:
         RefreshStorage,
     };
 
+    // The control mailbox stores one of these records plus has_mailbox_request_.
+    // Main writes the record under mailbox_mutex_; FileIO takes it under that mutex.
     struct Request {
         RequestKind kind = RequestKind::List;
         uint32_t operation_id = 0;
@@ -38,8 +39,8 @@ public:
     };
 
     FileIoManager(const Options& options, CommandQueue& messages,
-                  CircularBuffer<int16_t, kCircularBufferSamples>& recording,
-                  CircularBuffer<int16_t, kCircularBufferSamples>& playback);
+                  CircularBuffer& recording,
+                  CircularBuffer& playback);
     ~FileIoManager();
 
     // Storage operations below are executed by th_FileIO, not by Main.
@@ -60,6 +61,11 @@ private:
     void run();
     void set_file_thread_policy();
     void process_request(const Request& request);
+    void finish_recording(const Request& request);
+    void prepare_playback(const Request& request);
+    void list_archive(const Request& request);
+    void mount_storage(const Request& request);
+    void handle_removed_storage(const Request& request);
     bool write_recording();
     void read_playback();
     bool storage_available() const;
@@ -79,11 +85,12 @@ private:
 
     const Options& options_;
     CommandQueue& messages_;
-    CircularBuffer<int16_t, kCircularBufferSamples>& recording_;
-    CircularBuffer<int16_t, kCircularBufferSamples>& playback_;
+    CircularBuffer& recording_;
+    CircularBuffer& playback_;
     pthread_mutex_t mailbox_mutex_{};
     pthread_cond_t mailbox_ready_{};
-    optional<Request> mailbox_;
+    Request mailbox_{};
+    bool has_mailbox_request_ = false; // Mark mailbox request as empty.
     bool stopping_ = false;
     atomic<uint8_t> recording_error_{0};
     string mounted_device_;

@@ -1013,25 +1013,52 @@ deps_/home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/phonostet
     $(wildcard include/config/MODULES_USE_ELF_RELA) \
   arch/arm64/include/asm/device.h \
   include/linux/pm_wakeup.h \
-  include/linux/gpio/consumer.h \
-    $(wildcard include/config/GPIOLIB) \
-    $(wildcard include/config/GPIO_SYSFS) \
-  include/linux/of.h \
-    $(wildcard include/config/OF_DYNAMIC) \
-    $(wildcard include/config/SPARC) \
-    $(wildcard include/config/OF_PROMTREE) \
-    $(wildcard include/config/OF_KOBJ) \
-    $(wildcard include/config/OF_NUMA) \
-    $(wildcard include/config/OF_OVERLAY) \
-  include/linux/mod_devicetable.h \
-  include/uapi/linux/mei.h \
-  include/uapi/linux/mei_uuid.h \
-  include/linux/property.h \
+  include/linux/io.h \
+    $(wildcard include/config/HAS_IOPORT_MAP) \
+    $(wildcard include/config/PCI) \
+  arch/arm64/include/asm/io.h \
+  include/linux/pgtable.h \
+    $(wildcard include/config/HIGHPTE) \
+    $(wildcard include/config/ARCH_HAS_NONLEAF_PMD_YOUNG) \
+    $(wildcard include/config/ARCH_HAS_HW_PTE_YOUNG) \
+    $(wildcard include/config/GUP_GET_PXX_LOW_HIGH) \
+    $(wildcard include/config/ARCH_WANT_PMD_MKWRITE) \
+    $(wildcard include/config/HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD) \
+    $(wildcard include/config/HAVE_ARCH_SOFT_DIRTY) \
+    $(wildcard include/config/ARCH_ENABLE_THP_MIGRATION) \
+    $(wildcard include/config/ARCH_HAS_PTE_DEVMAP) \
+    $(wildcard include/config/HAVE_ARCH_HUGE_VMAP) \
+    $(wildcard include/config/X86_ESPFIX64) \
+  arch/arm64/include/asm/pgtable.h \
+    $(wildcard include/config/ARCH_SUPPORTS_PMD_PFNMAP) \
+    $(wildcard include/config/ARCH_SUPPORTS_PUD_PFNMAP) \
+    $(wildcard include/config/PAGE_TABLE_CHECK) \
+    $(wildcard include/config/ARM64_CONTPTE) \
+  arch/arm64/include/asm/proc-fns.h \
+  arch/arm64/include/asm/tlbflush.h \
+  include/linux/mmu_notifier.h \
+  include/linux/mmap_lock.h \
+  include/linux/interval_tree.h \
+  arch/arm64/include/asm/fixmap.h \
+    $(wildcard include/config/ACPI_APEI_GHES) \
+    $(wildcard include/config/ARM_SDE_INTERFACE) \
+  include/asm-generic/fixmap.h \
+  arch/arm64/include/asm/por.h \
+  include/linux/page_table_check.h \
+  include/asm-generic/pgtable_uffd.h \
+  arch/arm64/include/generated/asm/early_ioremap.h \
+  include/asm-generic/early_ioremap.h \
+    $(wildcard include/config/GENERIC_EARLY_IOREMAP) \
+  include/asm-generic/io.h \
+    $(wildcard include/config/GENERIC_IOMAP) \
+    $(wildcard include/config/TRACE_MMIO_ACCESS) \
+    $(wildcard include/config/GENERIC_IOREMAP) \
+  include/asm-generic/pci_iomap.h \
+    $(wildcard include/config/NO_GENERIC_PCI_IOPORT_MAP) \
+    $(wildcard include/config/GENERIC_PCI_IOMAP) \
+  include/linux/logic_pio.h \
+    $(wildcard include/config/INDIRECT_PIO) \
   include/linux/fwnode.h \
-  include/linux/platform_device.h \
-    $(wildcard include/config/SUSPEND) \
-    $(wildcard include/config/HIBERNATE_CALLBACKS) \
-    $(wildcard include/config/SUPERH) \
 
 /home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/phonostethos_leds.o: $(deps_/home/igor/Documents/Phonostethos/PhonoStethos_Code/kernel-driver/phonostethos_leds.o)
 

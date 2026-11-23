@@ -55,35 +55,63 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int? _archiveCursor;
   int _mode = 0;
   static const _gainCodes = [
-    101, 102, 103, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    gainHalf,
+    gainThreeQuarters,
+    gainFourFifths,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
   ];
   int _gain = 1;
   int? _gainPreview;
-  String _gainLabel(int code) => switch (code) {
-    101 => '0.5×',
-    102 => '0.75×',
-    103 => '0.8×',
-    _ => '$code×',
-  };
+  // Wire codes 101, 102 and 103 represent the fractional gain choices.
+  String _gainLabel(int code) {
+    if (code == gainHalf) return '0.5×';
+    if (code == gainThreeQuarters) return '0.75×';
+    if (code == gainFourFifths) return '0.8×';
+    return '$code×';
+  }
+
   Transport _transport = Transport.live;
   List<FlSpot> _waveform = const [FlSpot(0, 0)];
   List<double> _spectrumPower = [];
   List<FlSpot> _spectrumPeaks = [];
-  final _spectrumClock = Stopwatch()..start();
+  final _spectrumClock = Stopwatch();
   int _lastSpectrumUs = 0;
   List<FlSpot> _spectrum = const [FlSpot(0, -120)];
 
   @override
   void initState() {
     super.initState();
+    _spectrumClock.start();
     _connect();
   }
 
+  // FLOWCHART: GUI events -> connect to Raspberry Pi -> receive server packets.
   Future<void> _connect() async {
     if (_connecting || _connected || !mounted) return;
     _connecting = true;
     try {
+      // Dart API: Socket.connect(host, port, timeout: ...).
+      // Opens TCP asynchronously. await waits for the connection without freezing the UI.
+      // The Pi must be listening at this address. SocketException/TimeoutException handle failure.
       final socket = await Socket.connect(
         _host,
         _port,
@@ -100,7 +128,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _archiveCursor = 0;
       _pendingCommand = null;
       _errorText = null;
+      // Flutter API: setState(callback).
+      // Change the widget state in the callback. Flutter then rebuilds the screen.
+      // The callback must be synchronous. Network reads happen outside it.
       setState(() {});
+      // Dart API: socket.listen(onData, onError: ..., onDone: ...).
+      // Registers callbacks for received bytes, failure and connection closure.
+      // The returned subscription is cancelled when this dashboard is disposed.
       _subscription = socket.listen(
         _receive,
         onError: (Object error, StackTrace stack) =>
@@ -131,102 +165,138 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void _handleMessage(ServerMessage message) {
     if (!mounted) return;
     setState(() {
-      switch (message) {
-        case StatusMessage status:
-          _storageMounted = status.storageMounted;
-          _allowRecord = status.allowRecord;
-          _allowPlayback = status.allowPlayback;
-          if (status.errorCode != 0) {
-            _errorText = 'Server error ${status.errorCode}';
-          }
-        case StateMessage state:
-          if (_transport != state.transport || _mode != state.filter ||
-              _gain != state.gain) {
-            _spectrumPower = [];
-            _spectrumPeaks = [];
-          }
-          _transport = state.transport;
-          _mode = state.filter;
-          _gain = state.gain;
-          if (state.errorCode != 0) {
-            _errorText = 'Server error ${state.errorCode}';
-          }
-        case DataMessage data:
-          _waveform = List<FlSpot>.generate(
-            data.waveform.length,
-            (index) => FlSpot(index.toDouble(), data.waveform[index]),
-            growable: false,
-          );
-          // Lightly smooth power and display every received spectrum.
-          if (_spectrumPower.length != data.spectrum.length) {
-            _spectrumPower = data.spectrum.map((value) => value * value).toList();
-          } else {
-            for (var i = 0; i < data.spectrum.length; i++) {
-              final amplitude = data.spectrum[i];
-              _spectrumPower[i] =
-                  0.35 * _spectrumPower[i] + 0.65 * amplitude * amplitude;
-            }
-          }
-          final visibleHz = _modeBand(_mode).end;
-          final visibleBins = (visibleHz * 1024 / 8000).floor() + 1;
-          final now = _spectrumClock.elapsedMicroseconds;
-          final decayDb = (now - _lastSpectrumUs) * 8 / 1000000;
-          _lastSpectrumUs = now;
-          final previousPeaks = _spectrumPeaks;
-          _spectrumPeaks = List<FlSpot>.generate(visibleBins, (index) {
-            final current = spectrumDbfs(data.spectrum[index]);
-            final previous = index < previousPeaks.length
-                ? previousPeaks[index].y - decayDb
-                : current;
-            return FlSpot(index * (8000 / 1024),
-                current > previous ? current : previous);
-          }, growable: false);
-          _spectrum = List<FlSpot>.generate(
-            visibleBins,
-            (index) => FlSpot(
-              index * (8000 / 1024),
-              spectrumDbfs(sqrt(_spectrumPower[index])),
-            ),
-            growable: false,
-          );
-        case FileListMessage files:
-          final knownIds = _recordings.map((entry) => entry.id).toSet();
-          _recordings.addAll(
-            files.entries.where((entry) => !knownIds.contains(entry.id)),
-          );
-          _archiveCursor = files.nextCursor == 0 ? null : files.nextCursor;
-        case CommandResultMessage result:
-          if (_pendingCommand != result.command) {
-            _errorText = 'Unexpected command response';
-            break;
-          }
-          if (result.outcome == CommandOutcome.acceptedPending) {
-            break;
-          }
-          _pendingCommand = null;
-          _archiveLoading = false;
-          if (result.outcome == CommandOutcome.rejected ||
-              result.outcome == CommandOutcome.failed) {
-            _errorText =
-                'Command ${result.command.name} failed (code ${result.detail})';
-            break;
-          }
-          _errorText = null;
-          if (result.command == Command.getArchive && _archiveCursor != null) {
-            final cursor = _archiveCursor!;
-            _archiveCursor = null;
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) _request(Command.getArchive, cursor);
-            });
-          } else if (result.command == Command.deleteRecording) {
-            _refreshArchive();
-          }
+      if (message is StatusMessage) {
+        _storageMounted = message.storageMounted;
+        _allowRecord = message.allowRecord;
+        _allowPlayback = message.allowPlayback;
+        if (message.errorCode != 0) {
+          _errorText = 'Server error ${message.errorCode}';
+        }
+
+        return;
+      }
+      if (message is StateMessage) {
+        if (_transport != message.transport ||
+            _mode != message.filter ||
+            _gain != message.gain) {
+          _spectrumPower = [];
+          _spectrumPeaks = [];
+        }
+        _transport = message.transport;
+        _mode = message.filter;
+        _gain = message.gain;
+        if (message.errorCode != 0) {
+          _errorText = 'Server error ${message.errorCode}';
+        }
+
+        return;
+      }
+      if (message is DataMessage) {
+        _updatePlots(message);
+
+        return;
+      }
+      if (message is FileListMessage) {
+        _updateArchive(message);
+        return;
+      }
+      if (message is CommandResultMessage) {
+        _handleCommandResult(message);
+        return;
       }
     });
   }
 
+  // Called inside setState: add one archive page without duplicating file IDs.
+  void _updateArchive(FileListMessage message) {
+    for (final file in message.entries) {
+      bool alreadyListed = false;
+      for (final listedFile in _recordings) {
+        if (listedFile.id == file.id) {
+          alreadyListed = true;
+          break;
+        }
+      }
+      if (!alreadyListed) _recordings.add(file);
+    }
+    _archiveCursor = null;
+    if (message.nextCursor != 0) {
+      _archiveCursor = message.nextCursor;
+    }
+  }
+
+  // FLOWCHART: server reply -> clear pending -> refresh controls/archive.
+  // AcceptedPending is only an acknowledgement; keep waiting for the final result.
+  void _handleCommandResult(CommandResultMessage message) {
+    if (_pendingCommand != message.command) {
+      _errorText = 'Unexpected command response';
+      return;
+    }
+    if (message.outcome == CommandOutcome.acceptedPending) {
+      return;
+    }
+    _pendingCommand = null;
+    _archiveLoading = false;
+    if (message.outcome == CommandOutcome.rejected ||
+        message.outcome == CommandOutcome.failed) {
+      _errorText =
+          'Command ${message.command.name} failed (code ${message.detail})';
+      return;
+    }
+    _errorText = null;
+    if (message.command == Command.getArchive && _archiveCursor != null) {
+      final cursor = _archiveCursor!;
+      _archiveCursor = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _request(Command.getArchive, cursor);
+      });
+    } else if (message.command == Command.deleteRecording) {
+      _refreshArchive();
+    }
+  }
+
+  // Called inside setState after a complete Data frame has been decoded.
+  // The Pi computes FFT values. These loops only prepare points for the charts.
+  void _updatePlots(DataMessage data) {
+    _waveform = [];
+    for (int i = 0; i < data.waveform.length; i++) {
+      _waveform.add(FlSpot(i.toDouble(), data.waveform[i]));
+    }
+
+    bool firstFrame = _spectrumPower.length != data.spectrum.length;
+    if (firstFrame) _spectrumPower = List.filled(data.spectrum.length, 0.0);
+    for (int i = 0; i < data.spectrum.length; i++) {
+      double power = data.spectrum[i] * data.spectrum[i];
+      if (firstFrame) {
+        _spectrumPower[i] = power;
+      } else {
+        _spectrumPower[i] = 0.35 * _spectrumPower[i] + 0.65 * power;
+      }
+    }
+
+    int now = _spectrumClock.elapsedMicroseconds;
+    double decayDb = (now - _lastSpectrumUs) * 8 / 1000000;
+    _lastSpectrumUs = now;
+    int visibleBins = (_modeBand(_mode).end * 1024 / 8000).floor() + 1;
+    final previousPeaks = _spectrumPeaks;
+    _spectrum = [];
+    _spectrumPeaks = [];
+    for (int i = 0; i < visibleBins; i++) {
+      double frequency = i * 8000 / 1024;
+      double peakDb = spectrumDbfs(data.spectrum[i]);
+      if (i < previousPeaks.length) {
+        double previousDb = previousPeaks[i].y - decayDb;
+        if (previousDb > peakDb) peakDb = previousDb;
+      }
+      _spectrumPeaks.add(FlSpot(frequency, peakDb));
+      double liveDb = spectrumDbfs(sqrt(_spectrumPower[i]));
+      _spectrum.add(FlSpot(frequency, liveDb));
+    }
+  }
+
   // The GUI sends a request. The Pi validates it and returns CommandResult/State.
   // One pending command prevents conflicting button presses while workers finish.
+  // FLOWCHART: GUI send command -> mark pending -> send five bytes.
   void _request(Command command, int value) {
     if (!_connected || _pendingCommand != null) return;
     final socket = _socket;
@@ -236,6 +306,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (command == Command.getArchive) {
         _archiveLoading = true;
       }
+      // Dart API: Socket.add(bytes) queues bytes for TCP transmission.
+      // Socket.flush() requests delivery of buffered bytes and returns a Future.
+      // The server CommandResult, rather than this call, confirms the requested operation.
       socket.add(encodeCommand(command, value));
       socket.flush();
       if (mounted) setState(() {});
@@ -268,10 +341,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() {
       _errorText = reason;
     });
-    _reconnectTimer ??= Timer(const Duration(seconds: 3), () {
-      _reconnectTimer = null;
-      _connect();
-    });
+    if (_reconnectTimer == null) {
+      _reconnectTimer = Timer(const Duration(seconds: 3), () {
+        _reconnectTimer = null;
+        _connect();
+      });
+    }
   }
 
   @override
@@ -433,29 +508,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ),
             Slider(
-              value: _gainCodes.indexOf(_gainPreview ?? _gain)
-                  .clamp(0, _gainCodes.length - 1).toDouble(),
+              value: _gainCodes
+                  .indexOf(_gainPreview ?? _gain)
+                  .clamp(0, _gainCodes.length - 1)
+                  .toDouble(),
               max: (_gainCodes.length - 1).toDouble(),
               divisions: _gainCodes.length - 1,
               label: _gainLabel(_gainPreview ?? _gain),
               onChanged: _enabled
-                  ? (value) => setState(() => _gainPreview = _gainCodes[value.round()])
+                  ? (value) =>
+                      setState(() => _gainPreview = _gainCodes[value.round()])
                   : null,
-              onChangeEnd: _enabled ? (value) {
-                setState(() => _gainPreview = null);
-                _sendGain(_gainCodes[value.round()]);
-              } : null,
+              onChangeEnd: _enabled
+                  ? (value) {
+                      setState(() => _gainPreview = null);
+                      _sendGain(_gainCodes[value.round()]);
+                    }
+                  : null,
             ),
             const Text('Live Audio Capture'),
             const SizedBox(height: 12),
             FilledButton.icon(
-              onPressed: !_enabled
-                  ? null
-                  : _transport == Transport.recording
-                      ? () => _request(Command.stopRecording, 0)
-                      : _allowRecord && _transport == Transport.live
-                          ? () => _request(Command.startRecording, 0)
-                          : null,
+              onPressed: _canToggleRecording ? _toggleRecording : null,
               icon: Icon(
                 _transport == Transport.recording
                     ? Icons.stop_circle_outlined
@@ -489,6 +563,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   bool get _enabled => _connected && _pendingCommand == null;
 
+  // FLOWCHART: availability check. Stopping an active recording is allowed;
+  // starting a new one also requires storage permission and live transport.
+  bool get _canToggleRecording {
+    if (!_enabled) return false;
+    if (_transport == Transport.recording) return true;
+    return _allowRecord && _transport == Transport.live;
+  }
+
+  void _toggleRecording() {
+    if (_transport == Transport.recording) {
+      _request(Command.stopRecording, 0);
+    } else {
+      _request(Command.startRecording, 0);
+    }
+  }
+
   void _sendMode(int value) {
     setState(() => _mode = value);
     _request(Command.setMode, value);
@@ -514,11 +604,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String _modeName(int mode) =>
       const ['General', 'Heart', 'Lung'][mode.clamp(0, 2)];
 
-  RangeValues _modeBand(int mode) => switch (mode) {
-        1 => const RangeValues(20, 600),
-        2 => const RangeValues(100, 1000),
-        _ => const RangeValues(20, 2000),
-      };
+  RangeValues _modeBand(int mode) {
+    switch (mode) {
+      case 1:
+        return const RangeValues(20, 600);
+      case 2:
+        return const RangeValues(100, 1000);
+      default:
+        return const RangeValues(20, 2000);
+    }
+  }
 
   String _bandDescription(int mode) {
     final band = _modeBand(mode);
@@ -594,6 +689,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       );
 
   Future<void> _confirmDelete(FileEntry file) async {
+    // Flutter API: showDialog<bool>(context: ..., builder: ...).
+    // Shows a modal confirmation and returns the value supplied to Navigator.pop.
+    // Only true allows the selected delete request to be sent.
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -638,6 +736,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 8),
               Expanded(
+// fl_chart API: LineChart(LineChartData(...)).
+// Draws the series of FlSpot(frequencyHz, dBFS) points with explicit axis bounds.
+// The chart consumes values computed above and does not perform the FFT.
                 child: LineChart(
                   LineChartData(
                     minX: 0,
