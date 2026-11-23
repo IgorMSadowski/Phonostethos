@@ -37,7 +37,7 @@ Constructors prepare objects, buffers and mutexes; they do not start workers.
 
 Main opens the LED device and calls `DspProcessor::initialize()` to create the FFTW plan. **FFTW planning finishes before any worker pthread is created.** SystemController owns this DSP object and passes it by reference to AudioEngine.
 
-Main then starts AudioDSP and FileIO. AudioDSP opens/configures its own ALSA streams and reports AudioReady. FileIO checks storage and reports FileIOReady. Main handles those messages, and Network then starts listening. Missing storage disables storage-dependent controls while live audio remains possible. An unavailable LED device is reported without preventing audio startup.
+Main then starts AudioDSP and FileIO. AudioDSP opens/configures its own ALSA streams and reports AUDIO_READY. FileIO checks storage and reports FILEIO_READY. Main handles those messages, and Network then starts listening. Missing storage disables storage-dependent controls while live audio remains possible. An unavailable LED device is reported without preventing audio startup.
 
 ## 4. How a click becomes an operation
 
@@ -47,13 +47,13 @@ For example, clicking Record sends five bytes: command number 3 followed by a fo
 2. Network decodes the command and places it in **CommandQueue** as a MainMessage.
 3. Main takes the message. `processCommand()` validates it and calls `startRecording()`.
 4. Main asks FileIO to open a WAV file through FileIO's control mailbox. Main records that the operation is pending and continues dispatching messages.
-5. FileIO opens the WAV and puts a RecordingOpened result in CommandQueue.
+5. FileIO opens the WAV and puts a OPEN_READY result in CommandQueue.
 6. Main handles that result, enables the recording buffer, updates RECORDING and the LEDs, and queues the GUI replies.
 7. Network sends those replies to the GUI.
 
 Main passes the selected file ID directly to `startPlayback(file_id)` and the archive page cursor to `listFiles(cursor)`. In the dispatch flowchart, these values come from `cmd.value`. A cursor of zero requests the first page.
 
-A worker result is an internal message, not another TCP command. The report's OPEN_READY is named `WorkerResultCode::RecordingOpened` in code; RECORD_CLOSED is `RecordingClosed`. The meaning is the same.
+A worker result is an internal message, not another TCP command. The report and code use the same result names: `WorkerResultCode::OPEN_READY`, `RECORD_CLOSED`, `PLAYBACK_READY` and the other named worker outcomes.
 
 ## 5. Queues, buffers and mailboxes
 
@@ -219,7 +219,7 @@ Read the call site with this table. Names such as startRecording, readFrames and
 
 ## 15. Follow one command with the source open
 
-Start in Flutter's _request. The GUI places the encoded five bytes in the socket and marks the command pending. On the Pi, trace receiveCommand, CommandQueue, processCommand, then startRecording. Stop at the point that posts OpenRecording to FileIO. The next step happens on another thread, inside FileIoManager::process_request. Find RecordingOpened and trace that message back to handleWorkerResult on Main. Finally find the control reply in Network and the Flutter CommandResult handler. Repeat with STOP_REC to see where the buffer is drained and where the GUI learns that the WAV is closed.
+Start in Flutter's _request. The GUI places the encoded five bytes in the socket and marks the command pending. On the Pi, trace receiveCommand, CommandQueue, processCommand, then startRecording. Stop at the point that posts OPEN_RECORD to FileIO. The next step happens on another thread, inside FileIoManager::process_request. Find OPEN_READY and trace that message back to handleWorkerResult on Main. Finally find the control reply in Network and the Flutter CommandResult handler. Repeat with STOP_REC to see where the buffer is drained and where the GUI learns that the WAV is closed.
 
 See PI_TUTORIAL.md for deployment and REPORT_ALIGNMENT.md for the audit findings.
 
@@ -236,7 +236,7 @@ The target uses a FAT32 USB drive mounted at /media/usb_storage. The Linux files
 
 SystemController is now implemented in one source file. It previously had three source files for one class to separate startup, commands and replies. The section comments now serve that purpose.
 
-There is no std::optional in the application. Each mailbox and deferred operation uses a plain record and a boolean. DataQueue::try_dequeue(packet) returns a bool and fills its output argument only on success. Descriptors still use -1 for “not open.” A request is a struct, so a bool is clearer than using a number as an empty request.
+There is no std::optional in the application. Each mailbox and deferred operation uses a plain record and a boolean. DataQueue::dequeue(packet) returns a bool and fills its output argument only on success. Descriptors still use -1 for “not open.” A request is a struct, so a bool is clearer than using a number as an empty request.
 
 The LED driver follows the lesson's character-device structure with alloc_chrdev_region, cdev_init/cdev_add, class_create, device_create, write and module cleanup. It maps Raspberry Pi 4 GPIO registers at 0xFE200000. The lesson's 0x3F200000 base is for a different peripheral mapping and must not be copied to this Pi 4 driver. copy_from_user safely obtains the byte. The byte is binary, so shell “echo 1” is not this project's protocol.
 
@@ -318,7 +318,7 @@ Comments starting with `FLOWCHART:` identify the corresponding behavior. `CONTRO
 | Main -> AudioDSP control | `request_audio()` -> `AudioEngine::request()` | Copy a capture/playback request into AudioDSP's mailbox. |
 | FileIO checks control | `FileIoManager::run()` -> `process_request()` | Take the mailbox record, clear its occupied flag, then switch on RequestKind outside the mutex. |
 | Open recording WAV | `FileIoManager::openRecordFile()` | Create a new file exclusively and open it with libsndfile. |
-| Stop/finalize recording | `FileIoManager::finish_recording()` | Write remaining accepted samples, check closure, then report RecordingClosed. |
+| Stop/finalize recording | `FileIoManager::finish_recording()` | Write remaining accepted samples, check closure, then report RECORD_CLOSED. |
 | Prepare playback | `FileIoManager::prepare_playback()` | Validate the selected file identity/format and start filling the playback buffer. |
 | FileIO pop recording | `FileIoManager::write_recording()` | Pop samples, release the buffer lock, then call writeChunk. |
 | FileIO push playback | `FileIoManager::read_playback()` | Read WAV samples and push them into playback_buffer_. At EOF, close its producer gate. |
@@ -352,8 +352,8 @@ Read this as one trace rather than opening every file at once:
 1. GUI `_toggleRecording()` calls `_request(Command.startRecording, 0)`.
 2. Network `receiveCommand()` produces a CommandPacket and enqueues it in CommandQueue.
 3. Main `processMessage()` -> `processCommand()` -> `startRecording()`.
-4. `startRecording()` records a pending operation and puts OpenRecording in the FileIO mailbox.
-5. FileIO `run()` -> `process_request()` -> `openRecordFile()` -> `post_result(RecordingOpened, operation_id)`.
+4. `startRecording()` records a pending operation and puts OPEN_RECORD in the FileIO mailbox.
+5. FileIO `run()` -> `process_request()` -> `openRecordFile()` -> `post_result(OPEN_READY, operation_id)`.
 6. Main `handleWorkerResult()` -> `handle_recording_result()` opens the recording buffer gate and updates state/LEDs.
 7. AudioDSP `store_recording_block()` pushes processed samples; FileIO `write_recording()` pops and saves them.
 8. Main queues the completion/state replies; Network sends them; GUI `_handleCommandResult()` clears pending.
@@ -391,3 +391,76 @@ For FileIO, read `request()`, `take_request()`, then `process_request()` and its
 SystemController.cpp keeps its mailbox delivery and retry methods together. NetworkManager.cpp keeps ControlReplyQueue's storage operations and Main's queueing methods together; outgoing frame selection and socket transfer form the following section. CommandQueue.h, DataQueue.h and CircularBuffer.h explain their shared state and transfer lines beside the code.
 
 The refactor preserves public operation names, object initialization order and the communication policy: two one-slot control mailboxes, incoming Main messages through CommandQueue, FIFO control replies, one latest visualization snapshot and two separate sample buffers.
+
+
+## Matching the code to DESIGNTOEDIT
+
+The public method names and order are listed in `DESIGN_CODE_MAP.md` and in
+`Design_Code_Alignment/ClassDiagram_CodeAligned.drawio`. The report's Section
+3.4.2 uses these implemented interfaces. Constructors connect the references;
+the named design operations follow, then lifecycle/support operations. The
+remaining private helpers split those operations into smaller readable steps.
+
+Use these exact C++ names when searching:
+
+- `MessageKind::GUI_COMMAND`, `WORKER_RESULT`, `WORKER_ERROR` select Main's dispatch.
+- `CommandType::SET_MODE`, `SET_GAIN`, `START_REC`, `STOP_REC`, `PLAY_AUDIO`,
+  `STOP_PLAYBACK`, `EJECT_USB`, `GET_ARCHIVE`, `DELETE_RECORDING` identify commands.
+- `CommandPacket::cmd_type` contains the command choice; `value` contains its argument.
+- `FilterMode::GENERAL`, `HEART`, `LUNG` select the band-pass profile.
+- `DataPacket::waveform` and `fft_magnitudes` hold visualization samples.
+- `StatusPacket` holds the four capability/error bytes; serialization adds type 0x02.
+- `FileListPacket` holds parsed archive entries and a cursor, not a raw C++ wire image.
+- `DataQueue::enqueue/dequeue` use try-lock internally. Their ordinary names do not
+  mean they wait for a socket or for space.
+- `ControlReplyQueue::enqueue/dequeue` preserve FIFO order under an ordinary short mutex.
+
+### Read a recording through the files
+
+1. `NetworkManager::receiveCommand()` assembles five bytes. `decode_command()`
+   decodes `cmd_type`; `read_u32_be()` uses `memcpy` plus `ntohl` for its value.
+2. `CommandQueue::enqueue(CommandPacket)` wraps that record in `MainMessage` with
+   kind `GUI_COMMAND`. The protected queue stores it; a condition signal wakes Main.
+3. `SystemController::processCommand()` calls `startRecording()`. Main remembers a
+   pending operation and calls `writer_.request(...)`. **This call runs on Main**
+   and copies a struct into FileIO's mailbox. It does not open the WAV on Main.
+4. FileIO's `take_request()` copies and clears that mailbox slot under its mutex.
+   `process_request()` calls `openRecordFile()` after unlocking. Its result returns
+   through CommandQueue, not through the request mailbox.
+5. `handleWorkerResult()` enables the recording buffer only after opening succeeds.
+   AudioDSP calls `CircularBuffer::push()`; FileIO calls `pop()` then `writeChunk()`
+   outside the buffer lock.
+6. `stopRecording()` closes the producer gate. FileIO drains the remaining samples,
+   including a short last chunk, calls `closeFile()` and reports its outcome.
+   Main commits the result, writes the full LED mask and queues control replies.
+
+### The GUI send box
+
+`_request()` is an `async Future<void>` function. It prevents another command while
+one is pending, redraws disabled controls, calls `socket.add(encodeCommand(...))`
+and **awaits** `socket.flush()`. Socket/closed-stream failures use the ordinary
+disconnect/reconnect path. A flush finishing does not acknowledge server execution:
+only a final matching `CommandResult` clears a successful pending operation.
+
+### File headers and line comments
+
+Each handwritten C/C++ header/source, Dart source/test and standalone C/C++ test
+has an English `/** ... */` file header, a function directory, include/import
+reasons and comments on nonblank code lines. API blocks explain library calls;
+ordinary class methods implement the project's own operations. Generated plugin
+registrants, kernel `.mod.c`, build output and framework SDK files are not authored
+project code and are left generated.
+
+### Keep the architecture simple
+
+Main owns the objects directly and passes references; there is no pointer factory
+or extra wrapper hierarchy. One transport enum avoids conflicting playback/live
+booleans. Each worker has one plain request struct plus an occupied flag and a
+mutex. Requests travel Main-to-worker; results travel worker-to-CommandQueue-to-Main.
+Do not replace these separate directions with one shared queue consumed by several
+workers: the wrong worker could take a command intended for another one.
+
+Main's pending transition logic is the largest part of the code. Its worker
+acknowledgements are necessary to avoid announcing recording/playback before
+resources are ready. Keep the named command handlers and their smaller result
+helpers visible rather than adding a generic framework to hide them.
