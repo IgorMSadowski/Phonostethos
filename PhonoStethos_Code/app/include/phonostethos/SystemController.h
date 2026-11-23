@@ -102,11 +102,6 @@ private:
     void set_main_thread_policy();
     bool initUdevMonitor();
     void checkUsbEvents();
-    void dispatch_deferred_operation_request();
-    void dispatch_deferred_mount();
-    bool request_file(FileIoManager::Request request);
-    bool queue_file_request(FileIoManager::Request request);
-    bool request_audio(AudioEngine::Request request);
 
     const Options& options_;
     atomic<unsigned> mode_{static_cast<unsigned>(FilterMode::General)};
@@ -122,11 +117,24 @@ private:
     atomic<bool> audio_ready_{false};
     atomic<bool> audio_init_complete_{false};
     uint8_t storage_flags_ = 0;
+    // ================= THREAD COMMUNICATION MAP =================
+    // QUEUE:   Network + FileIO + AudioDSP -> command_queue_ -> Main
+    // QUEUE:   Main -> network_.control_replies_ -> Network -> GUI TCP socket
+    // QUEUE:   AudioDSP -> data_queue_ -> Network (latest waveform/FFT only)
+    // MAILBOX: Main -> writer_.mailbox_ -> FileIO (one unprocessed Request)
+    // MAILBOX: Main -> audio_.request_ -> AudioDSP (one unprocessed Request)
+    // BUFFER:  AudioDSP PUSH -> recording_buffer_ -> FileIO POP
+    // BUFFER:  FileIO PUSH -> playback_buffer_ -> AudioDSP POP
+    // The queues/buffers below are actual objects, shared by reference with workers.
+    // Each worker's control mailbox is declared inside its own class header.
+    // ============================================================
+    // SHARED CONFIGURATION: Main writes mode/gain; AudioDSP reads a snapshot.
+    // The mutex protects that snapshot; there is no configuration message queue.
     pthread_mutex_t configuration_mutex_{};
-    CircularBuffer recording_buffer_;
-    CircularBuffer playback_buffer_;
-    CommandQueue command_queue_;
-    DataQueue data_queue_;
+    CircularBuffer recording_buffer_; // Recording samples: AudioDSP -> FileIO.
+    CircularBuffer playback_buffer_;  // Playback samples: FileIO -> AudioDSP.
+    CommandQueue command_queue_;      // Main's incoming commands/results.
+    DataQueue data_queue_;            // Network's latest visualization snapshot.
     LedDriver led_driver_;
     FileIoManager writer_;
     // Destruction is in reverse order: AudioDSP joins before the FFT plan is destroyed.
@@ -139,14 +147,26 @@ private:
     uint32_t next_file_id_ = 1;
     uint32_t next_session_id_ = 1;
     uint32_t next_operation_id_ = 1;
+    // MAIN'S OWN BOOKKEEPING: which GUI operation is awaiting worker results.
+    // Main alone uses this record. Workers return MainMessage objects through
+    // CommandQueue; they do not write directly into pending_.
     PendingOperation pending_{};
-    bool has_pending_operation_ = false; // Mark pending operation as empty.
+    bool has_pending_operation_ = false; // True until that operation completes.
     bool initialized_ = false;
     bool stopping_ = false;
     chrono::steady_clock::time_point next_storage_check_{};
     udev* udev_context_ = nullptr;
     udev_monitor* udev_monitor_ = nullptr;
     int udev_fd_ = -1;
+    // MAILBOX DELIVERY: all send/retry helpers are implemented together in the .cpp.
+    bool request_file(FileIoManager::Request request); // Submit to FileIO's one slot.
+    bool queue_file_request(FileIoManager::Request request); // Submit or retain for retry.
+    bool request_audio(AudioEngine::Request request); // Submit to AudioDSP's one slot.
+    void dispatch_deferred_operation_request(); // Retry Main's retained storage operation.
+    void dispatch_deferred_mount(); // Retry Main's retained mount/device request.
+    // MAIN'S RETRY RECORDS: retain a FileIO request if its mailbox is occupied.
+    // Only Main uses these local slots. dispatch_deferred_* retries delivery;
+    // the shared FileIO mailbox itself is writer_.mailbox_ in FileIoManager.h.
     FileIoManager::Request deferred_operation_request_{};
     bool has_deferred_operation_ = false; // Mark deferred operation as empty.
     FileIoManager::Request deferred_storage_request_{};

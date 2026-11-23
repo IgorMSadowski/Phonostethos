@@ -14,6 +14,10 @@
 using namespace std; // Bring standard library identifiers into the current scope
 
 namespace phono_app { // Open the main PhonoStethos application namespace
+// ==================================================================
+// WORKER LIFETIME AND SCHEDULING
+// ==================================================================
+
 AudioEngine::AudioEngine( // Construct AudioEngine with configuration, DSP, atomics, queues, and ring buffers
     const Options& options, DspProcessor& dsp, atomic<unsigned>& mode, atomic<unsigned>& gain, // Options, DSP processor, filter mode, and gain
     atomic<bool>& recording, atomic<unsigned>& error_code, // Recording flag and global error code
@@ -77,20 +81,6 @@ bool AudioEngine::start() { // Spawn the audio worker thread
     return true; // Indicate startup success
 }
 
-// A mailbox holds one unprocessed control request; Main never changes ALSA directly.
-// CONTROL: Main deposits one request here; run() takes it before the next block.
-bool AudioEngine::request(Request request) { // Queue a single control request for the audio thread
-    PthreadLock lock(request_mutex_); // Lock request_mutex_ for the duration of this scope
-    if (stop_requested_.load() || has_request_) {
-        return false; // Reject if stopping or mailbox is full
-    }
-    request_ = request;
-    has_request_ = true; // Store pending request in the mailbox
-    return true; // Request accepted
-}
-
-bool AudioEngine::ready() const { return ready_.load(); } // Atomically check whether ALSA initialization completed
-
 void AudioEngine::stop() { // Request worker shutdown and join the thread
     stop_requested_.store(true); // Signal worker loops to stop
     { // Limit lock lifetime to the capture PCM drop check
@@ -120,6 +110,148 @@ void AudioEngine::stop() { // Request worker shutdown and join the thread
         worker_started_ = false; // Reset started flag
     }
 }
+
+bool AudioEngine::ready() const { return ready_.load(); } // Atomically check whether ALSA initialization completed
+
+void AudioEngine::set_audio_thread_policy() { // Pin audio thread to CPU 1 and configure real-time FIFO scheduling
+    cpu_set_t cpus; // CPU affinity bitmask
+    /*
+     * CPU_ZERO & CPU_SET (POSIX/glibc):
+     * Clears a `cpu_set_t` bitmask and sets bit 1 so the thread can run only on CPU core 1.
+     */
+    CPU_ZERO(&cpus); // Clear CPU mask
+    CPU_SET(1, &cpus); // Add CPU core 1 to the mask
+    /*
+     * pthread_setaffinity_np (POSIX/glibc):
+     * Restricts the specified thread to execute only on the CPUs set in `cpus`.
+     */
+    const int affinity_result = // Apply CPU affinity to current thread
+        /* API: pthread_setaffinity_np
+         * Ask Linux to run this pthread on the CPUs in cpu_set_t. pthread_self identifies the current worker. Check the returned error number.
+         */
+        pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Set affinity for self
+    if (affinity_result != 0) { // Check if setting CPU affinity failed
+        cerr << "Audio thread CPU affinity not set: " // Log warning to stderr
+                  << strerror(affinity_result) << '\n'; // Print error description
+    }
+    sched_param priority{}; // Zero-initialized scheduling parameter structure
+    priority.sched_priority = 80; // Set real-time priority level to 80
+    /*
+     * pthread_setschedparam (POSIX):
+     * Sets the scheduling policy (SCHED_FIFO) and priority parameters for the given thread.
+     */
+    const int scheduling_result = // Attempt to enable SCHED_FIFO real-time scheduling
+        /* API: pthread_setschedparam
+         * Request the scheduling policy and sched_priority stored in sched_param. FIFO 80 is AudioDSP and FIFO 50 is FileIO. SCHED_OTHER requires priority 0.
+         */
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &priority); // Apply policy and priority
+    if (scheduling_result != 0) { // May fail if process lacks CAP_SYS_NICE or rlimit permissions
+        cerr << "Audio thread SCHED_FIFO unavailable: " // Log notice to stderr
+                  << strerror(scheduling_result) << '\n'; // Print error description
+    }
+}
+
+// ==================================================================
+// MAILBOX: MAIN SENDS -> AUDIODSP TAKES -> AUDIODSP EXECUTES
+// ==================================================================
+
+// A mailbox holds one unprocessed control request; Main never changes ALSA directly.
+// CONTROL: Main deposits one request here; run() takes it before the next block.
+bool AudioEngine::request(Request request) { // Queue a single control request for the audio thread
+    // MAILBOX SEND (called by Main): hold the mutex while checking the slot
+    // AND copying the request, so AudioDSP cannot take a half-written record.
+    PthreadLock lock(request_mutex_); // Unlocks automatically on every return.
+    if (stop_requested_.load() || has_request_) {
+        return false; // Reject if stopping or mailbox is full
+    }
+    request_ = request;    // Copy the complete control record into the shared slot.
+    has_request_ = true; // Occupied until AudioDSP takes it in run().
+    return true; // Request accepted
+}
+
+// MAILBOX RECEIVE: AudioDSP takes one record before processing the next block.
+bool AudioEngine::take_request(Request& request) {
+    PthreadLock lock(request_mutex_); // Lock the same mutex used by Main's request().
+    request = request_;              // Copy the shared slot into the caller's local record.
+    bool available = has_request_;   // Remember whether that record was a pending request.
+    has_request_ = false;            // Free the shared slot for Main's next request.
+    return available;                // Unlock automatically; only process a true result.
+}
+
+// Only AudioDSP executes these ALSA transitions, at an audio-block boundary.
+bool AudioEngine::apply_request(Request request, // Apply a control request inside the audio worker
+                               bool& playback_active) { // Reference to local playback state flag
+    using phono::protocol::Error; // Bring protocol Error enum into local scope
+    switch (request.kind) { // Execute the LOCAL mailbox copy; its mutex is already unlocked.
+        case RequestKind::SuspendCapture: { // Suspend microphone capture
+            const int result = suspendCapture() ? 0 : -EIO; // Map suspend failure to -EIO
+            if (result < 0) { // Check if suspending failed
+                error_code_.store(static_cast<unsigned>(Error::MicLost)); // Record MicLost error
+                post_result(WorkerResultCode::CaptureSuspended, // Post CaptureSuspended result
+                            request.operation_id, // Include operation_id
+                            static_cast<uint8_t>(Error::MicLost)); // Include MicLost error code
+                return false; // Indicate failure
+            }
+            dsp_.reset(); // Clear DSP history and filter state
+            post_result(WorkerResultCode::CaptureSuspended, // Notify successful capture suspension
+                        request.operation_id); // Include operation_id
+            return true; // Indicate success
+        }
+        case RequestKind::ResumeCapture: { // Resume microphone capture
+            const int result = resumeCapture() ? 0 : -EIO; // Reopen/configure capture; map failure to -EIO
+            if (result < 0) { // Check if reopening capture failed
+                cerr << "Cannot reopen capture PCM '" // Log error prefix
+                     << options_.capture_pcm << "': " << snd_strerror(result) // Log PCM name and ALSA error
+                     << '\n'; // End line
+                error_code_.store(static_cast<unsigned>(Error::MicLost)); // Record MicLost error
+                post_result(WorkerResultCode::CaptureResumed, // Post CaptureResumed result
+                            request.operation_id, // Include operation_id
+                            static_cast<uint8_t>(Error::MicLost)); // Include MicLost error code
+                return false; // Indicate failure
+            }
+            dsp_.reset(); // Reset DSP state after resuming capture
+            post_result(WorkerResultCode::CaptureResumed, // Notify successful capture resume
+                        request.operation_id); // Include operation_id
+            return true; // Indicate success
+        }
+        case RequestKind::StartPlayback: // Switch worker into playback mode
+            playback_active = true; // Enable playback mode flag
+            dsp_.reset(); // Reset DSP state before playing audio
+            post_result(WorkerResultCode::PlaybackStarted, // Notify that playback started
+                        request.operation_id); // Include operation_id
+            return true; // Indicate success
+        case RequestKind::StopPlayback: // Exit playback mode
+            playback_active = false; // Disable playback mode flag
+            dsp_.reset(); // Reset DSP state when leaving playback
+            post_result(WorkerResultCode::PlaybackStopped, // Notify that playback stopped
+                        request.operation_id); // Include operation_id
+            return true; // Indicate success
+    }
+    return false; // Fallback return for unhandled request kinds
+}
+
+// ==================================================================
+// COMMANDQUEUE: AUDIODSP REPORTS RESULTS TO MAIN
+// ==================================================================
+
+void AudioEngine::post_result(WorkerResultCode code, uint32_t operation_id, // Enqueue a worker result/error to Main
+                              uint8_t error) { // Error code (0 means no error)
+    MainMessage message; // Message structure consumed by SystemController
+    message.kind = MessageKind::WorkerResult;
+    if (error != 0) {
+        message.kind = MessageKind::WorkerError;
+    }
+    message.operation_id = operation_id; // Set matching operation identifier
+    message.result_code = code; // Set worker result code
+    message.error_code = error; // Set error code
+    // QUEUE SEND: messages_ is Main's command_queue_ shared by reference.
+    // Result travels AudioDSP -> CommandQueue; Main runs handleWorkerResult().
+    messages_.enqueue(move(message)); // Queue signals Main; this does not run Main here.
+}
+
+// ==================================================================
+// ALSA DEVICE ACCESS AND RECOVERY
+// ==================================================================
 
 int AudioEngine::configure_pcm(snd_pcm_t* pcm) { // Configure ALSA hardware and software parameters for a PCM stream
     snd_pcm_hw_params_t* params; // Pointer to ALSA hardware parameter container
@@ -242,109 +374,6 @@ bool AudioEngine::recover_pcm(snd_pcm_t* pcm, snd_pcm_sframes_t error) { // Atte
     return false; // Indicate unhandled/unrecovered error
 }
 
-void AudioEngine::set_audio_thread_policy() { // Pin audio thread to CPU 1 and configure real-time FIFO scheduling
-    cpu_set_t cpus; // CPU affinity bitmask
-    /*
-     * CPU_ZERO & CPU_SET (POSIX/glibc):
-     * Clears a `cpu_set_t` bitmask and sets bit 1 so the thread can run only on CPU core 1.
-     */
-    CPU_ZERO(&cpus); // Clear CPU mask
-    CPU_SET(1, &cpus); // Add CPU core 1 to the mask
-    /*
-     * pthread_setaffinity_np (POSIX/glibc):
-     * Restricts the specified thread to execute only on the CPUs set in `cpus`.
-     */
-    const int affinity_result = // Apply CPU affinity to current thread
-        /* API: pthread_setaffinity_np
-         * Ask Linux to run this pthread on the CPUs in cpu_set_t. pthread_self identifies the current worker. Check the returned error number.
-         */
-        pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Set affinity for self
-    if (affinity_result != 0) { // Check if setting CPU affinity failed
-        cerr << "Audio thread CPU affinity not set: " // Log warning to stderr
-                  << strerror(affinity_result) << '\n'; // Print error description
-    }
-    sched_param priority{}; // Zero-initialized scheduling parameter structure
-    priority.sched_priority = 80; // Set real-time priority level to 80
-    /*
-     * pthread_setschedparam (POSIX):
-     * Sets the scheduling policy (SCHED_FIFO) and priority parameters for the given thread.
-     */
-    const int scheduling_result = // Attempt to enable SCHED_FIFO real-time scheduling
-        /* API: pthread_setschedparam
-         * Request the scheduling policy and sched_priority stored in sched_param. FIFO 80 is AudioDSP and FIFO 50 is FileIO. SCHED_OTHER requires priority 0.
-         */
-        pthread_setschedparam(pthread_self(), SCHED_FIFO, &priority); // Apply policy and priority
-    if (scheduling_result != 0) { // May fail if process lacks CAP_SYS_NICE or rlimit permissions
-        cerr << "Audio thread SCHED_FIFO unavailable: " // Log notice to stderr
-                  << strerror(scheduling_result) << '\n'; // Print error description
-    }
-}
-
-void AudioEngine::post_result(WorkerResultCode code, uint32_t operation_id, // Enqueue a worker result/error to Main
-                              uint8_t error) { // Error code (0 means no error)
-    MainMessage message; // Message structure consumed by SystemController
-    message.kind = MessageKind::WorkerResult;
-    if (error != 0) {
-        message.kind = MessageKind::WorkerError;
-    }
-    message.operation_id = operation_id; // Set matching operation identifier
-    message.result_code = code; // Set worker result code
-    message.error_code = error; // Set error code
-    messages_.enqueue(move(message)); // Push message into thread-safe command queue
-}
-
-// Only AudioDSP executes these ALSA transitions, at an audio-block boundary.
-bool AudioEngine::apply_request(Request request, // Apply a control request inside the audio worker
-                               bool& playback_active) { // Reference to local playback state flag
-    using phono::protocol::Error; // Bring protocol Error enum into local scope
-    switch (request.kind) { // Dispatch based on request kind
-        case RequestKind::SuspendCapture: { // Suspend microphone capture
-            const int result = suspendCapture() ? 0 : -EIO; // Map suspend failure to -EIO
-            if (result < 0) { // Check if suspending failed
-                error_code_.store(static_cast<unsigned>(Error::MicLost)); // Record MicLost error
-                post_result(WorkerResultCode::CaptureSuspended, // Post CaptureSuspended result
-                            request.operation_id, // Include operation_id
-                            static_cast<uint8_t>(Error::MicLost)); // Include MicLost error code
-                return false; // Indicate failure
-            }
-            dsp_.reset(); // Clear DSP history and filter state
-            post_result(WorkerResultCode::CaptureSuspended, // Notify successful capture suspension
-                        request.operation_id); // Include operation_id
-            return true; // Indicate success
-        }
-        case RequestKind::ResumeCapture: { // Resume microphone capture
-            const int result = resumeCapture() ? 0 : -EIO; // Reopen/configure capture; map failure to -EIO
-            if (result < 0) { // Check if reopening capture failed
-                cerr << "Cannot reopen capture PCM '" // Log error prefix
-                     << options_.capture_pcm << "': " << snd_strerror(result) // Log PCM name and ALSA error
-                     << '\n'; // End line
-                error_code_.store(static_cast<unsigned>(Error::MicLost)); // Record MicLost error
-                post_result(WorkerResultCode::CaptureResumed, // Post CaptureResumed result
-                            request.operation_id, // Include operation_id
-                            static_cast<uint8_t>(Error::MicLost)); // Include MicLost error code
-                return false; // Indicate failure
-            }
-            dsp_.reset(); // Reset DSP state after resuming capture
-            post_result(WorkerResultCode::CaptureResumed, // Notify successful capture resume
-                        request.operation_id); // Include operation_id
-            return true; // Indicate success
-        }
-        case RequestKind::StartPlayback: // Switch worker into playback mode
-            playback_active = true; // Enable playback mode flag
-            dsp_.reset(); // Reset DSP state before playing audio
-            post_result(WorkerResultCode::PlaybackStarted, // Notify that playback started
-                        request.operation_id); // Include operation_id
-            return true; // Indicate success
-        case RequestKind::StopPlayback: // Exit playback mode
-            playback_active = false; // Disable playback mode flag
-            dsp_.reset(); // Reset DSP state when leaving playback
-            post_result(WorkerResultCode::PlaybackStopped, // Notify that playback stopped
-                        request.operation_id); // Include operation_id
-            return true; // Indicate success
-    }
-    return false; // Fallback return for unhandled request kinds
-}
-
 // Open/configure capture and headphones inside the audio worker.
 bool AudioEngine::initAlsa() { // Open and configure capture and playback PCM devices
     using phono::protocol::Error; // Bring protocol Error enum into local scope
@@ -453,6 +482,30 @@ bool AudioEngine::resumeCapture() { // Close and reopen capture PCM device
     return result >= 0; // Return true if reopen and configuration succeeded
 }
 
+// FLOWCHART: writeFrames to headphones. ALSA may accept only part of a block.
+void AudioEngine::write_output_block(const int16_t* output, snd_pcm_sframes_t count) {
+    using phono::protocol::Error;
+    snd_pcm_sframes_t written = 0; // Frames written so far to playback PCM
+    while (written < count && !stop_requested_.load()) { // Loop until all frames are written
+        const auto result = writeFrames(output + written, // Write starting at offset `written`
+            static_cast<int>(count - written)); // Remaining frames to write
+        if (result < 0) { // Handle playback write error
+            if (!recover_pcm(playback_handle_, result)) { // Attempt PCM recovery
+                error_code_.store(static_cast<unsigned>(Error::OutputError)); // Record OutputError
+                post_result(WorkerResultCode::AudioReady, 0, // Notify audio output failure
+                            static_cast<uint8_t>(Error::OutputError)); // OutputError code
+                break; // Abort writing current block
+            }
+        } else { // Frames written successfully
+            written += result; // Advance written frame count
+        }
+    }
+}
+
+// ==================================================================
+// LIVE/PLAYBACK GAIN AND LIMITER
+// ==================================================================
+
 // FLOWCHART: gain + limiter. Both microphone and WAV playback use this step.
 // applied_gain is kept between blocks so slider changes do not jump abruptly.
 void AudioEngine::apply_output_gain(float* filtered, int16_t* output,
@@ -482,29 +535,16 @@ void AudioEngine::apply_output_gain(float* filtered, int16_t* output,
     }
 }
 
-// FLOWCHART: writeFrames to headphones. ALSA may accept only part of a block.
-void AudioEngine::write_output_block(const int16_t* output, snd_pcm_sframes_t count) {
-    using phono::protocol::Error;
-    snd_pcm_sframes_t written = 0; // Frames written so far to playback PCM
-    while (written < count && !stop_requested_.load()) { // Loop until all frames are written
-        const auto result = writeFrames(output + written, // Write starting at offset `written`
-            static_cast<int>(count - written)); // Remaining frames to write
-        if (result < 0) { // Handle playback write error
-            if (!recover_pcm(playback_handle_, result)) { // Attempt PCM recovery
-                error_code_.store(static_cast<unsigned>(Error::OutputError)); // Record OutputError
-                post_result(WorkerResultCode::AudioReady, 0, // Notify audio output failure
-                            static_cast<uint8_t>(Error::OutputError)); // OutputError code
-                break; // Abort writing current block
-            }
-        } else { // Frames written successfully
-            written += result; // Advance written frame count
-        }
-    }
-}
+// ==================================================================
+// RECORDING BUFFER: AUDIODSP PUSHES -> FILEIO POPS
+// ==================================================================
 
 // FLOWCHART: push recording samples; reject a full buffer without overwriting audio.
 void AudioEngine::store_recording_block(const int16_t* output, snd_pcm_sframes_t count) {
     using phono::protocol::Error;
+    // BUFFER SEND: recording_buffer_ is the shared AudioDSP -> FileIO sample path.
+    // push copies samples under the buffer mutex and signals its data condition.
+    // FileIO later pops them; this call does not write the WAV itself.
     if (!recording_buffer_.push(output, static_cast<size_t>(count)) && // Check if push failed
         !recording_buffer_.stopped()) { // Failure while not stopped indicates buffer overrun
         recording_.store(false); // Stop recording flag
@@ -516,6 +556,10 @@ void AudioEngine::store_recording_block(const int16_t* output, snd_pcm_sframes_t
     }
 }
 
+// ==================================================================
+// DATAQUEUE: AUDIODSP PUBLISHES THE LATEST WAVEFORM/FFT
+// ==================================================================
+
 // FLOWCHART: FFT -> DataQueue. This step must not wait for the GUI.
 void AudioEngine::publish_visualization(const int16_t* output, snd_pcm_sframes_t count) {
     array<float, kFftBins> magnitudes{};
@@ -525,9 +569,15 @@ void AudioEngine::publish_visualization(const int16_t* output, snd_pcm_sframes_t
         Telemetry telemetry; // Telemetry packet for network thread
         telemetry.waveform = dsp_.waveform(); // Copy prepared waveform samples
         telemetry.spectrum = magnitudes; // Copy computed FFT magnitudes
-        if (!telemetry_.try_enqueue(telemetry)) dropped_telemetry_.fetch_add(1); // Count drop if queue is full
+        // QUEUE SEND: telemetry_ is SystemController::data_queue_. Network takes
+        // the latest snapshot; if busy/disconnected, this visualization is skipped.
+        if (!telemetry_.try_enqueue(telemetry)) dropped_telemetry_.fetch_add(1); // Count a skipped snapshot.
     }
 }
+
+// ==================================================================
+// WORKER LOOP: USE THE COMMUNICATION AND PROCESSING METHODS ABOVE
+// ==================================================================
 
 // FLOWCHART: th_AudioDSP parts 1-3, read in processing order.
 void AudioEngine::run() { // Main processing loop for the audio worker thread
@@ -550,14 +600,8 @@ void AudioEngine::run() { // Main processing loop for the audio worker thread
     bool playback_completion_sent = false; // Tracks whether PlaybackFinished was already posted
     uint32_t playback_operation = 0; // Operation ID of the active playback session
     while (!stop_requested_.load() && running.load()) { // Run until stop requested or global shutdown
-        Request request{};
-        bool has_request = false; // A plain request record copied from the mailbox
-        { // Critical section to pop request from mailbox
-            PthreadLock lock(request_mutex_); // Lock request_mutex_
-            request = request_;
-            has_request = has_request_; // Remember whether the mailbox contained a request
-            has_request_ = false; // Clear mailbox slot
-        } // Unlock request_mutex_
+        Request request{}; // Local copy of the control record for this loop pass.
+        bool has_request = take_request(request); // Read/free the shared mailbox slot.
         if (has_request) { // Process request if one was present
             if (request.kind == RequestKind::SuspendCapture) { // Mark capture suspended
                 capture_suspended = true; // Set suspended state
@@ -573,6 +617,7 @@ void AudioEngine::run() { // Main processing loop for the audio worker thread
         snd_pcm_sframes_t count = 0; // Number of valid frames produced in this iteration
         unsigned gain_code = gain_.load(); // Snapshot current gain code
         if (playback_active) { // Playback path reading from playback_buffer_
+            // BUFFER RECEIVE: FileIO produced these WAV samples in playback_buffer_.
             const auto samples = playback_buffer_.pop( // Pop samples from playback ring buffer
                 output.data(), output.size(), chrono::milliseconds(10)); // Wait up to 10 ms for data
             count = static_cast<snd_pcm_sframes_t>(samples); // Convert sample count to PCM frames

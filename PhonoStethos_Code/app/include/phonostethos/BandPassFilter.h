@@ -52,8 +52,7 @@ private:
         // cutoff = desired corner frequency; sample_rate = samples per second.
         // q controls the damping/resonance of this individual second-order section.
         // Convert the cutoff from Hz into radians per sample: omega = 2*pi*fc/Fs.
-        const double omega = 2.0 * 3.14159265358979323846 * cutoff /
-                             sample_rate;
+        const double omega = 2.0 * 3.14159265358979323846 * cutoff / sample_rate;
         const double cosine = cos(omega);
         // Cookbook intermediate value for the Q-based coefficient equations.
         const double alpha = sin(omega) / (2.0 * q);

@@ -48,6 +48,9 @@ inline timespec waitDeadline(long milliseconds) {
 
 // This small scope guard only pairs pthread_mutex_lock with unlock.
 // Returning early from a function still releases the mutex.
+// READING THE COMMUNICATION CODE: { PthreadLock lock(mutex); ... } locks on entry
+// and unlocks at the closing brace. It protects the mailbox/queue/buffer data
+// accessed in that scope; it does not itself store or transfer any message.
 class PthreadLock {
 public:
     explicit PthreadLock(pthread_mutex_t& mutex) : mutex_(mutex) {

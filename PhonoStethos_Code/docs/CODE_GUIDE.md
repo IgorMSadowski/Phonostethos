@@ -378,3 +378,16 @@ The protocol originally used integer values 1–20 to mean 1x–20x. SET_GAIN ca
 The native tests cover filter response, framing/gain values, buffer gates/partial blocks, pthread synchronization, FFT scaling, WAV round-trip/finalization and LED mask bytes. `controller-tcp-test` additionally runs the real server with ALSA null and temporary storage to exercise commands across all four execution contexts, including playback EOF and return to live. The EOF regression uses an empty valid WAV to isolate the transition because ALSA null has no real-time pacing; the nonempty WAV round-trip is tested separately by runtime-test. The integration checks found a missing output preparation after snd_pcm_drain; AudioDSP now checks snd_pcm_prepare before reporting successful EOF. ALSA's stream states are documented at https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html.
 
 Flutter protocol tests check command encoding, fragmented frames, all supported gain codes, file IDs and float decoding. Cross-compilation checks the Raspberry Pi executable. These checks do not replace listening tests, scheduling checks and GPIO/storage tests on the actual Pi.
+
+
+## Grouped communication code
+
+Each worker source now has named sections for lifetime/scheduling, mailbox operations, result queues, audio buffers and the worker loop. Read a communication section before following its calls from run(). The related private method declarations sit beside their mailbox/queue/buffer fields in the headers; public mailbox Request types and request() declarations stay together.
+
+For AudioDSP, read `request()` (Main sends), `take_request()` (AudioDSP copies/frees the slot), then `apply_request()` (AudioDSP performs the operation after unlocking). These three implementations are adjacent in AudioEngine.cpp. `take_request()` returns true only when there was a pending record. The worker loop then handles that local record.
+
+For FileIO, read `request()`, `take_request()`, then `process_request()` and its request handlers in the same source section. `take_request()` contains the idle condition wait and shared-slot access. It returns 1 for a copied request, 0 to continue ordinary file work, or -1 to stop when no mailbox item remains. The worker processes a copied request outside the mailbox mutex, then handles recording/playback data.
+
+SystemController.cpp keeps its mailbox delivery and retry methods together. NetworkManager.cpp keeps ControlReplyQueue's storage operations and Main's queueing methods together; outgoing frame selection and socket transfer form the following section. CommandQueue.h, DataQueue.h and CircularBuffer.h explain their shared state and transfer lines beside the code.
+
+The refactor preserves public operation names, object initialization order and the communication policy: two one-slot control mailboxes, incoming Main messages through CommandQueue, FIFO control replies, one latest visualization snapshot and two separate sample buffers.

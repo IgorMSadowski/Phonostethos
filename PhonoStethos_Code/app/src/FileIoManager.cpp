@@ -108,6 +108,10 @@ bool storage_ready(const Options& options) {
     return false;
 }
 
+// ==================================================================
+// WORKER LIFETIME AND SCHEDULING
+// ==================================================================
+
 FileIoManager::FileIoManager(
     const Options& options, CommandQueue& messages,
     CircularBuffer& recording,
@@ -144,24 +148,6 @@ bool FileIoManager::start() {
         return false;
     }
     worker_started_ = true;
-    return true;
-}
-
-// Publish one request under the mailbox mutex; file I/O happens after unlocking.
-// CONTROL: Main deposits one request here. run() takes it and calls process_request().
-bool FileIoManager::request(Request request) {
-    {
-        PthreadLock lock(mailbox_mutex_);
-        if (stopping_ || has_mailbox_request_) {
-            return false;
-        }
-        mailbox_ = request;
-        has_mailbox_request_ = true; // Mark mailbox request as available.
-    }
-    /* API: pthread_cond_signal
-     * Wake one thread waiting on this condition variable. Change the protected condition under its mutex first. The signal itself does not store data.
-     */
-    pthread_cond_signal(&mailbox_ready_);
     return true;
 }
 
@@ -214,305 +200,52 @@ void FileIoManager::set_file_thread_policy() {
     }
 }
 
-void FileIoManager::post_result(WorkerResultCode code, uint32_t operation_id,
-                                uint8_t error) {
-    MainMessage message;
-    message.kind = MessageKind::WorkerResult;
-    if (error != 0) {
-        message.kind = MessageKind::WorkerError;
-    }
-    message.operation_id = operation_id;
-    message.result_code = code;
-    message.error_code = error;
-    messages_.enqueue(move(message));
-}
+// ==================================================================
+// MAILBOX: MAIN SENDS -> FILEIO TAKES -> FILEIO DISPATCHES
+// ==================================================================
 
-bool FileIoManager::storage_available() const {
-    return !storage_removed_ && storage_ready(options_);
-}
-
-void FileIoManager::post_storage_status(WorkerResultCode code,
-                                        uint32_t operation_id) {
-    MainMessage message;
-    message.kind = MessageKind::WorkerResult;
-    message.operation_id = operation_id;
-    message.result_code = code;
-    error_code error;
-    if (!mounted_device_.empty() && !storage_removed_) {
-        message.storage_flags |= phono::protocol::StoragePresent;
-    }
-    if (storage_available()) {
-        message.storage_flags |= phono::protocol::StorageMounted;
-        if (::access(options_.storage.c_str(), R_OK) == 0) {
-            message.storage_flags |= phono::protocol::StorageReadable;
+// Publish one request under the mailbox mutex; file I/O happens after unlocking.
+// CONTROL: Main deposits one request here. run() takes it and calls process_request().
+bool FileIoManager::request(Request request) {
+    {
+        PthreadLock lock(mailbox_mutex_); // Main owns the slot/flag lock until this block ends.
+        if (stopping_ || has_mailbox_request_) { // Refuse stopping/full; never overwrite an unread request.
+            return false; // Unlock through PthreadLock; the caller must handle rejection.
         }
-        if (::access(options_.storage.c_str(), W_OK) == 0) {
-            message.storage_flags |= phono::protocol::StorageWritable;
-        }
-        error.clear();
-        const auto space = filesystem::space(options_.storage, error);
-        if (!error && space.available >= 1024 * 1024) {
-            message.storage_flags |= phono::protocol::StorageSpaceOk;
-        }
+        // MAILBOX SEND (Main): copy the record while the mutex protects the slot.
+        mailbox_ = request;
+        has_mailbox_request_ = true; // Publish that this slot contains a request.
     }
-    messages_.enqueue(move(message));
-}
-
-// pop() releases its buffer mutex before the potentially slow disk write.
-bool FileIoManager::write_recording() {
-    auto* file = recording_file_;
-    if (file == nullptr) {
-        return false;
-    }
-    if (!storage_available()) {
-        recording_error_.store(
-            static_cast<uint8_t>(phono::protocol::Error::StorageLost));
-        recording_.stop_producing();
-        return false;
-    }
-    array<int16_t, kPeriodFrames> samples{};
-    const auto count = recording_.pop(samples.data(), samples.size());
-    if (count == 0) {
-        return true;
-    }
-    const auto written = writeChunk(samples.data(), static_cast<sf_count_t>(count));
-    if (written != static_cast<sf_count_t>(count)) {
-        const auto error = errno == ENOSPC
-                               ? phono::protocol::Error::DiskFull
-                               : phono::protocol::Error::WriteError;
-        cerr << "Audio recording write failed: " << sf_strerror(file) << '\n';
-        recording_error_.store(static_cast<uint8_t>(error)); // Update the shared recording error value atomically.
-        recording_.stop_producing();
-        return false;
-    }
-    return true;
-}
-
-// Read only what fits: FileIO produces playback; AudioDSP consumes it.
-void FileIoManager::read_playback() {
-    auto* file = playback_file_;
-    const auto operation_id = playback_operation_;
-    if (file == nullptr || !playback_active_) {
-        return;
-    }
-    const auto available = playback_.available_capacity();
-    if (available == 0) {
-        return;
-    }
-    array<int16_t, kPeriodFrames> samples{};
-    const auto requested = min(available, samples.size());
-    const auto count = readChunk(samples.data(), static_cast<sf_count_t>(requested));
-    if (count < 0 || sf_error(file) != SF_ERR_NO_ERROR) {
-        cerr << "Playback WAV read failed: " << sf_strerror(file) << '\n';
-        playback_.stop_producing();
-        playback_active_ = false;
-        post_result(WorkerResultCode::PlaybackFinished, operation_id,
-                    static_cast<uint8_t>(
-                        phono::protocol::Error::ReadError));
-        return;
-    }
-    if (count == 0) {
-        playback_.stop_producing();
-        playback_active_ = false;
-        return;
-    }
-    if (!playback_.push(samples.data(), static_cast<size_t>(count))) {
-        cerr << "Playback buffer changed while FileIO was producing samples\n";
-    }
-}
-
-// Called only by th_FileIO: no other thread touches these SNDFILE handles.
-bool FileIoManager::openRecordFile(const string& filename) {
-    using phono::protocol::Error;
-    last_error_ = static_cast<uint8_t>(Error::StorageLost);
-    if (!storage_available() || recording_file_ || playback_file_) {
-        return false;
-    }
-    /* API: ::open
-     * Open the path with the requested flags. Returns a file descriptor or -1 with errno. O_EXCL with O_CREAT prevents overwriting an existing recording.
+    /* API: pthread_cond_signal
+     * Wake one thread waiting on this condition variable. Change the protected condition under its mutex first. The signal itself does not store data.
      */
-    recording_fd_ = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (recording_fd_ < 0) {
-        last_error_ = static_cast<uint8_t>(errno == ENOSPC ? Error::DiskFull : Error::OpenError);
-        return false;
-    }
-    SF_INFO info{};
-    info.samplerate = kSampleRate;
-    info.channels = 1;
-    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
-    /* API: sf_open_fd
-     * Create a libsndfile handle around an open descriptor. Supply read/write mode, SF_INFO and whether libsndfile should close the descriptor. This project checks and closes its own descriptor separately.
-     */
-    recording_file_ = sf_open_fd(recording_fd_, SFM_WRITE, &info, SF_FALSE);
-    if (!recording_file_) {
-        const int open_error = errno;
-        /* API: ::close
-         * Release a descriptor after its owner has finished using it. Set the stored descriptor to -1 so it cannot be reused accidentally.
-         */
-        ::close(recording_fd_);
-        recording_fd_ = -1;
-        error_code ignored;
-        filesystem::remove(filename, ignored);
-        last_error_ = static_cast<uint8_t>(open_error == ENOSPC ? Error::DiskFull : Error::OpenError);
-        return false;
-    }
-    recording_active_ = true;
-    recording_error_.store(0); // Update the shared recording error value atomically.
-    last_error_ = 0;
-    return true;
+    // Wake FileIO if it is in its idle condition wait. The request is in mailbox_,
+    // not in this signal. If FileIO is doing work, it checks the slot next loop.
+    pthread_cond_signal(&mailbox_ready_);
+    return true; // Accepted into the slot; the operation will complete later.
 }
 
-bool FileIoManager::openPlaybackFile(const string& filename) {
-    using phono::protocol::Error;
-    last_error_ = static_cast<uint8_t>(Error::StorageLost);
-    if (!storage_available() || recording_file_ || playback_file_) {
-        return false;
+// MAILBOX RECEIVE: FileIO may wait when idle, then takes a request outside its I/O work.
+// Return 1 = request copied, 0 = continue normal work, -1 = stop this worker.
+int FileIoManager::take_request(Request& request) {
+    PthreadLock lock(mailbox_mutex_); // Protect the shared record, occupied flag and stop state.
+    const auto deadline = waitDeadline(10); // Absolute deadline for this idle wait.
+    while (!stopping_ && !has_mailbox_request_ &&
+           !recording_active_ && (!playback_active_ || playback_.isFull())) {
+        // API: pthread_cond_timedwait releases this mutex while sleeping and
+        // reacquires it on return. Recheck the conditions after every wake-up.
+        const int result = pthread_cond_timedwait(
+            &mailbox_ready_, &mailbox_mutex_, &deadline);
+        if (result == ETIMEDOUT) break; // End the idle wait and let the worker loop recheck work.
+        checkPthread(result);           // Other pthread errors must not be ignored.
     }
-    playback_fd_ = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (playback_fd_ < 0) {
-        last_error_ = static_cast<uint8_t>(Error::ReadError);
-        return false;
+    if (has_mailbox_request_) {         // A mailbox request takes precedence over stopping.
+        request = mailbox_;            // Copy the shared request into the local output record.
+        has_mailbox_request_ = false;  // Make the shared slot available to Main again.
+        return 1;                      // Unlock automatically before processing the request.
     }
-    SF_INFO info{};
-    playback_file_ = sf_open_fd(playback_fd_, SFM_READ, &info, SF_FALSE);
-    last_error_ = static_cast<uint8_t>(Error::ReadError);
-    if (!playback_file_) { closeFile(); return false; }
-    if (info.channels != 1 || info.samplerate != kSampleRate ||
-        (info.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
-        (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
-        last_error_ = static_cast<uint8_t>(Error::UnsupportedWav);
-        closeFile();
-        return false;
-    }
-    last_error_ = 0;
-    return true;
-}
-
-vector<string> FileIoManager::getFileList() {
-    vector<string> names;
-    last_error_ = static_cast<uint8_t>(phono::protocol::Error::StorageLost);
-    if (!storage_available()) {
-        return names;
-    }
-    error_code error;
-    for (filesystem::directory_iterator it(options_.storage, error), end;
-         !error && it != end; it.increment(error)) {
-        if (it->path().extension() == ".wav") names.push_back(it->path().filename().string());
-    }
-    if (error) {
-        last_error_ = static_cast<uint8_t>(phono::protocol::Error::ReadError);
-        return {};
-    }
-    sort(names.begin(), names.end());
-    last_error_ = 0;
-    return names;
-}
-
-sf_count_t FileIoManager::writeChunk(const int16_t* data, sf_count_t count) {
-    /* API: sf_write_short
-     * Write the requested number of PCM16 sample items. Check that the returned count equals the requested count before accepting a successful recording write.
-     */
-    if (recording_file_ == nullptr) {
-        return 0;
-    }
-    return sf_write_short(recording_file_, data, count);
-}
-
-sf_count_t FileIoManager::readChunk(int16_t* data, sf_count_t count) {
-    /* API: sf_read_short
-     * Read PCM16 sample items. A short count can be the final block, zero can be EOF, and sf_error distinguishes a file error.
-     */
-    if (playback_file_ == nullptr) {
-        return 0;
-    }
-    return sf_read_short(playback_file_, data, count);
-}
-
-// The caller drains recording samples first; this method checks WAV finalization.
-bool FileIoManager::closeFile() {
-    using phono::protocol::Error;
-    bool success = true;
-    if (recording_file_) {
-        /* API: sf_write_sync
-         * Flush libsndfile buffered recording data. Check sf_error and the final sf_close result as well.
-         */
-        sf_write_sync(recording_file_);
-        if (sf_error(recording_file_) != SF_ERR_NO_ERROR) {
-            recording_error_.store(static_cast<uint8_t>(Error::WriteError)); // Update the shared recording error value atomically.
-            success = false;
-        }
-        /* API: sf_close
-         * Finalize the WAV header and release the libsndfile handle. Zero means success. FileIO owns this handle.
-         */
-        if (sf_close(recording_file_) != 0) {
-            if (recording_error_.load() == 0) recording_error_.store(static_cast<uint8_t>(Error::FinalizeError));
-            success = false;
-        }
-        recording_file_ = nullptr;
-    }
-    if (recording_fd_ >= 0) {
-        if (::close(recording_fd_) != 0) success = false;
-        recording_fd_ = -1;
-    }
-    if (playback_file_) {
-        if (sf_close(playback_file_) != 0) success = false;
-        playback_file_ = nullptr;
-    }
-    if (playback_fd_ >= 0) {
-        if (::close(playback_fd_) != 0) success = false;
-        playback_fd_ = -1;
-    }
-    return success;
-}
-
-bool FileIoManager::deleteRecordFile(const string& filename) {
-    using phono::protocol::Error;
-    last_error_ = static_cast<uint8_t>(Error::StorageLost);
-    if (!storage_available() || recording_file_ || playback_file_) {
-        return false;
-    }
-    // A basename is a name, never a path supplied by the GUI.
-    if (filename.empty() || filename.find_first_of("/\\") != string::npos || filename == "." || filename == "..") {
-        last_error_ = static_cast<uint8_t>(Error::InvalidArgument);
-        return false;
-    }
-    error_code error;
-    if (!filesystem::remove(options_.storage / filename, error) || error) {
-        last_error_ = static_cast<uint8_t>(Error::WriteError);
-        return false;
-    }
-    last_error_ = 0;
-    return true;
-}
-
-bool FileIoManager::ejectStorage() {
-    using phono::protocol::Error;
-    last_error_ = static_cast<uint8_t>(Error::Busy);
-    if (recording_file_ || playback_file_) {
-        return false;
-    }
-    if (!storage_available()) {
-        last_error_ = static_cast<uint8_t>(Error::StorageLost);
-        return false;
-    }
-    last_error_ = static_cast<uint8_t>(Error::UnmountError);
-    const int fd = ::open(options_.storage.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0) {
-        return false;
-    }
-    /* API: ::syncfs
-     * Synchronize the filesystem containing this open descriptor. Check its result before allowing safe USB removal.
-     */
-    const bool synced = ::syncfs(fd) == 0;
-    const bool closed = ::close(fd) == 0;
-    /* API: ::umount2
-     * Unmount the FAT32 mount point. Zero means success. Failure must not produce a safe-to-remove acknowledgement.
-     */
-    if (!synced || !closed || ::umount2(options_.storage.c_str(), 0) != 0) {
-        return false;
-    }
-    last_error_ = 0;
-    return true;
+    if (stopping_) return -1;           // No queued request remains; tell run() to finish.
+    return 0;                          // No request; continue recording/playback work unlocked.
 }
 
 // Dispatch control independently of recording data: LIST/EJECT also work while idle.
@@ -812,6 +545,329 @@ void FileIoManager::handle_removed_storage(const Request& request) {
     return;
 }
 
+// ==================================================================
+// COMMANDQUEUE: FILEIO REPORTS RESULTS AND STORAGE STATE TO MAIN
+// ==================================================================
+
+void FileIoManager::post_result(WorkerResultCode code, uint32_t operation_id,
+                                uint8_t error) {
+    MainMessage message;
+    message.kind = MessageKind::WorkerResult;
+    if (error != 0) {
+        message.kind = MessageKind::WorkerError;
+    }
+    message.operation_id = operation_id;
+    message.result_code = code;
+    message.error_code = error;
+    // QUEUE SEND: messages_ is the SAME command_queue_ that Main dequeues.
+    // This reports completion/failure; it does not write into Main's pending_ record.
+    messages_.enqueue(move(message));
+}
+
+void FileIoManager::post_storage_status(WorkerResultCode code,
+                                        uint32_t operation_id) {
+    MainMessage message;
+    message.kind = MessageKind::WorkerResult;
+    message.operation_id = operation_id;
+    message.result_code = code;
+    error_code error;
+    if (!mounted_device_.empty() && !storage_removed_) {
+        message.storage_flags |= phono::protocol::StoragePresent;
+    }
+    if (storage_available()) {
+        message.storage_flags |= phono::protocol::StorageMounted;
+        if (::access(options_.storage.c_str(), R_OK) == 0) {
+            message.storage_flags |= phono::protocol::StorageReadable;
+        }
+        if (::access(options_.storage.c_str(), W_OK) == 0) {
+            message.storage_flags |= phono::protocol::StorageWritable;
+        }
+        error.clear();
+        const auto space = filesystem::space(options_.storage, error);
+        if (!error && space.available >= 1024 * 1024) {
+            message.storage_flags |= phono::protocol::StorageSpaceOk;
+        }
+    }
+    messages_.enqueue(move(message));
+}
+
+// ==================================================================
+// AUDIO BUFFERS: POP RECORDING / PUSH PLAYBACK
+// ==================================================================
+
+// pop() releases its buffer mutex before the potentially slow disk write.
+bool FileIoManager::write_recording() {
+    auto* file = recording_file_;
+    if (file == nullptr) {
+        return false;
+    }
+    if (!storage_available()) {
+        recording_error_.store(
+            static_cast<uint8_t>(phono::protocol::Error::StorageLost));
+        recording_.stop_producing();
+        return false;
+    }
+    array<int16_t, kPeriodFrames> samples{};
+    // BUFFER RECEIVE: recording_ aliases SystemController::recording_buffer_.
+    // AudioDSP pushed the samples; pop unlocks before the disk write below.
+    const auto count = recording_.pop(samples.data(), samples.size());
+    if (count == 0) {
+        return true;
+    }
+    const auto written = writeChunk(samples.data(), static_cast<sf_count_t>(count));
+    if (written != static_cast<sf_count_t>(count)) {
+        const auto error = errno == ENOSPC
+                               ? phono::protocol::Error::DiskFull
+                               : phono::protocol::Error::WriteError;
+        cerr << "Audio recording write failed: " << sf_strerror(file) << '\n';
+        recording_error_.store(static_cast<uint8_t>(error)); // Update the shared recording error value atomically.
+        recording_.stop_producing();
+        return false;
+    }
+    return true;
+}
+
+// Read only what fits: FileIO produces playback; AudioDSP consumes it.
+void FileIoManager::read_playback() {
+    auto* file = playback_file_;
+    const auto operation_id = playback_operation_;
+    if (file == nullptr || !playback_active_) {
+        return;
+    }
+    const auto available = playback_.available_capacity();
+    if (available == 0) {
+        return;
+    }
+    array<int16_t, kPeriodFrames> samples{};
+    const auto requested = min(available, samples.size());
+    const auto count = readChunk(samples.data(), static_cast<sf_count_t>(requested));
+    if (count < 0 || sf_error(file) != SF_ERR_NO_ERROR) {
+        cerr << "Playback WAV read failed: " << sf_strerror(file) << '\n';
+        playback_.stop_producing();
+        playback_active_ = false;
+        post_result(WorkerResultCode::PlaybackFinished, operation_id,
+                    static_cast<uint8_t>(
+                        phono::protocol::Error::ReadError));
+        return;
+    }
+    if (count == 0) {
+        playback_.stop_producing();
+        playback_active_ = false;
+        return;
+    }
+    // BUFFER SEND: playback_ aliases SystemController::playback_buffer_.
+    // AudioDSP will pop these samples; the buffer condition signals availability.
+    if (!playback_.push(samples.data(), static_cast<size_t>(count))) {
+        cerr << "Playback buffer changed while FileIO was producing samples\n";
+    }
+}
+
+// ==================================================================
+// WAV FILES AND STORAGE OPERATIONS
+// ==================================================================
+
+bool FileIoManager::storage_available() const {
+    return !storage_removed_ && storage_ready(options_);
+}
+
+// Called only by th_FileIO: no other thread touches these SNDFILE handles.
+bool FileIoManager::openRecordFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) {
+        return false;
+    }
+    /* API: ::open
+     * Open the path with the requested flags. Returns a file descriptor or -1 with errno. O_EXCL with O_CREAT prevents overwriting an existing recording.
+     */
+    recording_fd_ = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (recording_fd_ < 0) {
+        last_error_ = static_cast<uint8_t>(errno == ENOSPC ? Error::DiskFull : Error::OpenError);
+        return false;
+    }
+    SF_INFO info{};
+    info.samplerate = kSampleRate;
+    info.channels = 1;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+    /* API: sf_open_fd
+     * Create a libsndfile handle around an open descriptor. Supply read/write mode, SF_INFO and whether libsndfile should close the descriptor. This project checks and closes its own descriptor separately.
+     */
+    recording_file_ = sf_open_fd(recording_fd_, SFM_WRITE, &info, SF_FALSE);
+    if (!recording_file_) {
+        const int open_error = errno;
+        /* API: ::close
+         * Release a descriptor after its owner has finished using it. Set the stored descriptor to -1 so it cannot be reused accidentally.
+         */
+        ::close(recording_fd_);
+        recording_fd_ = -1;
+        error_code ignored;
+        filesystem::remove(filename, ignored);
+        last_error_ = static_cast<uint8_t>(open_error == ENOSPC ? Error::DiskFull : Error::OpenError);
+        return false;
+    }
+    recording_active_ = true;
+    recording_error_.store(0); // Update the shared recording error value atomically.
+    last_error_ = 0;
+    return true;
+}
+
+bool FileIoManager::openPlaybackFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) {
+        return false;
+    }
+    playback_fd_ = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (playback_fd_ < 0) {
+        last_error_ = static_cast<uint8_t>(Error::ReadError);
+        return false;
+    }
+    SF_INFO info{};
+    playback_file_ = sf_open_fd(playback_fd_, SFM_READ, &info, SF_FALSE);
+    last_error_ = static_cast<uint8_t>(Error::ReadError);
+    if (!playback_file_) { closeFile(); return false; }
+    if (info.channels != 1 || info.samplerate != kSampleRate ||
+        (info.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
+        (info.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
+        last_error_ = static_cast<uint8_t>(Error::UnsupportedWav);
+        closeFile();
+        return false;
+    }
+    last_error_ = 0;
+    return true;
+}
+
+vector<string> FileIoManager::getFileList() {
+    vector<string> names;
+    last_error_ = static_cast<uint8_t>(phono::protocol::Error::StorageLost);
+    if (!storage_available()) {
+        return names;
+    }
+    error_code error;
+    for (filesystem::directory_iterator it(options_.storage, error), end;
+         !error && it != end; it.increment(error)) {
+        if (it->path().extension() == ".wav") names.push_back(it->path().filename().string());
+    }
+    if (error) {
+        last_error_ = static_cast<uint8_t>(phono::protocol::Error::ReadError);
+        return {};
+    }
+    sort(names.begin(), names.end());
+    last_error_ = 0;
+    return names;
+}
+
+sf_count_t FileIoManager::writeChunk(const int16_t* data, sf_count_t count) {
+    /* API: sf_write_short
+     * Write the requested number of PCM16 sample items. Check that the returned count equals the requested count before accepting a successful recording write.
+     */
+    if (recording_file_ == nullptr) {
+        return 0;
+    }
+    return sf_write_short(recording_file_, data, count);
+}
+
+sf_count_t FileIoManager::readChunk(int16_t* data, sf_count_t count) {
+    /* API: sf_read_short
+     * Read PCM16 sample items. A short count can be the final block, zero can be EOF, and sf_error distinguishes a file error.
+     */
+    if (playback_file_ == nullptr) {
+        return 0;
+    }
+    return sf_read_short(playback_file_, data, count);
+}
+
+// The caller drains recording samples first; this method checks WAV finalization.
+bool FileIoManager::closeFile() {
+    using phono::protocol::Error;
+    bool success = true;
+    if (recording_file_) {
+        /* API: sf_write_sync
+         * Flush libsndfile buffered recording data. Check sf_error and the final sf_close result as well.
+         */
+        sf_write_sync(recording_file_);
+        if (sf_error(recording_file_) != SF_ERR_NO_ERROR) {
+            recording_error_.store(static_cast<uint8_t>(Error::WriteError)); // Update the shared recording error value atomically.
+            success = false;
+        }
+        /* API: sf_close
+         * Finalize the WAV header and release the libsndfile handle. Zero means success. FileIO owns this handle.
+         */
+        if (sf_close(recording_file_) != 0) {
+            if (recording_error_.load() == 0) recording_error_.store(static_cast<uint8_t>(Error::FinalizeError));
+            success = false;
+        }
+        recording_file_ = nullptr;
+    }
+    if (recording_fd_ >= 0) {
+        if (::close(recording_fd_) != 0) success = false;
+        recording_fd_ = -1;
+    }
+    if (playback_file_) {
+        if (sf_close(playback_file_) != 0) success = false;
+        playback_file_ = nullptr;
+    }
+    if (playback_fd_ >= 0) {
+        if (::close(playback_fd_) != 0) success = false;
+        playback_fd_ = -1;
+    }
+    return success;
+}
+
+bool FileIoManager::deleteRecordFile(const string& filename) {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::StorageLost);
+    if (!storage_available() || recording_file_ || playback_file_) {
+        return false;
+    }
+    // A basename is a name, never a path supplied by the GUI.
+    if (filename.empty() || filename.find_first_of("/\\") != string::npos || filename == "." || filename == "..") {
+        last_error_ = static_cast<uint8_t>(Error::InvalidArgument);
+        return false;
+    }
+    error_code error;
+    if (!filesystem::remove(options_.storage / filename, error) || error) {
+        last_error_ = static_cast<uint8_t>(Error::WriteError);
+        return false;
+    }
+    last_error_ = 0;
+    return true;
+}
+
+bool FileIoManager::ejectStorage() {
+    using phono::protocol::Error;
+    last_error_ = static_cast<uint8_t>(Error::Busy);
+    if (recording_file_ || playback_file_) {
+        return false;
+    }
+    if (!storage_available()) {
+        last_error_ = static_cast<uint8_t>(Error::StorageLost);
+        return false;
+    }
+    last_error_ = static_cast<uint8_t>(Error::UnmountError);
+    const int fd = ::open(options_.storage.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        return false;
+    }
+    /* API: ::syncfs
+     * Synchronize the filesystem containing this open descriptor. Check its result before allowing safe USB removal.
+     */
+    const bool synced = ::syncfs(fd) == 0;
+    const bool closed = ::close(fd) == 0;
+    /* API: ::umount2
+     * Unmount the FAT32 mount point. Zero means success. Failure must not produce a safe-to-remove acknowledgement.
+     */
+    if (!synced || !closed || ::umount2(options_.storage.c_str(), 0) != 0) {
+        return false;
+    }
+    last_error_ = 0;
+    return true;
+}
+
+// ==================================================================
+// WORKER LOOP: MAILBOX FIRST, THEN RECORDING/PLAYBACK WORK
+// ==================================================================
+
 // This pthread owns all WAV handles and filesystem operations.
 // FLOWCHART: th_FileIO -> take control request -> pop recording / push playback.
 void FileIoManager::run() {
@@ -819,33 +875,14 @@ void FileIoManager::run() {
     if (storage_available()) mounted_device_ = mounted_source(options_.storage);
     post_storage_status(WorkerResultCode::FileIOReady, 0);
     while (true) {
-        Request request{};
-        bool has_request = false; // Mark request as empty.
-        {
-            PthreadLock lock(mailbox_mutex_);
-            const auto deadline = waitDeadline(10);
-            while (!stopping_ && !has_mailbox_request_ &&
-                   !recording_active_ && (!playback_active_ || playback_.isFull())) {
-                /* API: pthread_cond_timedwait
-                 * Sleep until signalled or until an absolute timespec deadline. The mutex must already be held. The call releases it while sleeping and reacquires it before returning. Recheck the predicate after waking.
-                 */
-                const int result = pthread_cond_timedwait(
-                    &mailbox_ready_, &mailbox_mutex_, &deadline);
-                if (result == ETIMEDOUT) break;
-                checkPthread(result);
-            }
-            if (has_mailbox_request_) {
-                request = mailbox_;
-                has_request = true; // Mark request as available.
-                has_mailbox_request_ = false; // Mark mailbox request as empty.
-            } else if (stopping_) {
-                break;
-            }
-        }
-        if (has_request) {
+        Request request{}; // Local control record; shared mailbox data stays protected.
+        int mailbox_result = take_request(request); // 1 = request, 0 = no request, -1 = stop.
+        if (mailbox_result < 0) break; // Worker is stopping and has no pending mailbox item.
+        if (mailbox_result > 0) {
             if (request.kind == RequestKind::OpenRecording) {
                 recording_operation_ = request.operation_id;
             }
+            // Mailbox mutex is already released. Slow file calls must not hold it.
             process_request(request);
         }
 

@@ -24,10 +24,11 @@
 /app/.flutter-plugins-dependencies
 /app/linux/flutter/ephemeral/
 # Practical diagnostics: keep sources and guides; ignore generated binaries.
-!/HardwareTests/
-!/SystemTests/
-/HardwareTests/**/build-pi/
-/HardwareTests/**/build-host/
-/SystemTests/**/build-pi/
-/SystemTests/**/build-host/
-/SystemTests/**/__pycache__/
+!/Test Folder/
+/Test Folder/HardwareTests/**/build-pi/
+/Test Folder/HardwareTests/**/build-host/
+/Test Folder/SystemTests/**/build-pi/
+/Test Folder/SystemTests/**/build-host/
+/Test Folder/SystemTests/**/__pycache__/
+/Test Folder/HardwareTests/pi-bundle/
+/Test Folder/HardwareTests/phonostethos-tests-pi.tar.gz

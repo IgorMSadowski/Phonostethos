@@ -24,6 +24,9 @@ static bool compare_file_names(const phono::protocol::FileEntry& first,
     return first.basename < second.basename;
 }
 
+// WIRING: pass the SAME queue/buffer objects by reference to all their users.
+// writer_ owns its FileIO mailbox; audio_ owns its AudioDSP mailbox;
+// network_ owns ControlReplyQueue. See the communication map in the class header.
 SystemController::SystemController(const Options& options)
     : options_(options),
       led_driver_(options.led_device),
@@ -91,6 +94,8 @@ void SystemController::run() {
         return;
     }
     while (running.load() && !stopping_) {
+        // QUEUE RECEIVE: Main takes one command/result from command_queue_.
+        // dequeue() waits on the queue condition if empty and unlocks on return.
         MainMessage message;
         if (command_queue_.dequeue(message, chrono::milliseconds(10))) {
             processMessage(message);
@@ -148,6 +153,10 @@ uint32_t SystemController::begin_operation(
     return operation_id;
 }
 
+// ==================================================================
+// MAILBOX DELIVERY AND RETRIES: MAIN -> FILEIO / AUDIODSP
+// ==================================================================
+
 // CONTROL: Main -> FileIO mailbox (one request record, not a socket call).
 bool SystemController::request_file(FileIoManager::Request request) {
     if (writer_.request(request)) {
@@ -165,6 +174,8 @@ bool SystemController::queue_file_request(FileIoManager::Request request) {
         cerr << "A deferred FileIO operation is already pending\n";
         return false;
     }
+    // Main keeps this locally until FileIO's shared mailbox has a free slot.
+    // It has not been delivered yet; dispatch_deferred_operation_request retries.
     deferred_operation_request_ = request;
     has_deferred_operation_ = true; // Mark deferred operation as available.
     return true;
@@ -177,6 +188,25 @@ bool SystemController::request_audio(AudioEngine::Request request) {
     }
     cerr << "Audio request rejected because its mailbox is occupied\n";
     return false;
+}
+
+void SystemController::dispatch_deferred_operation_request() {
+    if (!has_deferred_operation_) {
+        return;
+    }
+    // RETRY DELIVERY: clear Main's local retry flag only after mailbox acceptance.
+    if (writer_.request(deferred_operation_request_)) {
+        has_deferred_operation_ = false; // Mark deferred operation as empty.
+    }
+}
+
+void SystemController::dispatch_deferred_mount() {
+    if (!has_deferred_storage_) {
+        return;
+    }
+    if (writer_.request(deferred_storage_request_)) {
+        has_deferred_storage_ = false; // Mark deferred storage as empty.
+    }
 }
 
 // These methods enqueue replies. Only th_Network writes to the TCP socket.
@@ -471,24 +501,6 @@ void SystemController::checkUsbEvents() {
     }
 }
 
-void SystemController::dispatch_deferred_mount() {
-    if (!has_deferred_storage_) {
-        return;
-    }
-    if (writer_.request(deferred_storage_request_)) {
-        has_deferred_storage_ = false; // Mark deferred storage as empty.
-    }
-}
-
-void SystemController::dispatch_deferred_operation_request() {
-    if (!has_deferred_operation_) {
-        return;
-    }
-    if (writer_.request(deferred_operation_request_)) {
-        has_deferred_operation_ = false; // Mark deferred operation as empty.
-    }
-}
-
 // ==================================================================
 // GUI COMMAND HANDLERS
 // ==================================================================
@@ -608,6 +620,9 @@ void SystemController::startRecording() {
     file_request.kind = FileIoManager::RequestKind::OpenRecording;
     file_request.operation_id = operation_id;
     file_request.path = path;
+    // MAILBOX SEND: the struct is ready; request_file -> writer_.request copies
+    // it into FileIO's mailbox. true means accepted, not that the WAV is open.
+    // FileIO later reports RecordingOpened through CommandQueue with this ID.
     if (!request_file(file_request)) {
         has_pending_operation_ = false; // Mark pending operation as empty.
         publish_command_result(command, Result::Rejected,
@@ -1456,5 +1471,4 @@ void SystemController::fail_start_playback(uint8_t error_code) {
         complete_operation(false, pending_.error_code);
     }
 }
-
 }  // namespace phono_app

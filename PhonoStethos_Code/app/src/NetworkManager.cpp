@@ -21,25 +21,9 @@
 using namespace std;
 
 namespace phono_app {
-void ControlReplyQueue::enqueue(vector<uint8_t> frame) {
-    PthreadLock lock(mutex_);
-    queue_.push_back(move(frame));
-}
-
-bool ControlReplyQueue::try_dequeue(vector<uint8_t>& frame) {
-    PthreadLock lock(mutex_);
-    if (queue_.empty()) {
-        return false;
-    }
-    frame = move(queue_.front());
-    queue_.pop_front();
-    return true;
-}
-
-void ControlReplyQueue::clear() {
-    PthreadLock lock(mutex_);
-    queue_.clear();
-}
+// ==================================================================
+// WORKER LIFETIME AND SCHEDULING
+// ==================================================================
 
 NetworkManager::NetworkManager(const Options& options, CommandQueue& messages,
                                DataQueue& telemetry)
@@ -86,22 +70,6 @@ void NetworkManager::stop() {
 
 bool NetworkManager::connected() const { return connected_.load(); }
 
-// CONTROL: Main -> ControlReplyQueue -> Network TCP send. This preserves reply order.
-void NetworkManager::queue_control(vector<uint8_t> frame) {
-    control_replies_.enqueue(move(frame));
-}
-
-void NetworkManager::post_network_event(WorkerResultCode code, uint8_t error) {
-    MainMessage message;
-    message.kind = MessageKind::WorkerResult;
-    if (error != 0) {
-        message.kind = MessageKind::WorkerError;
-    }
-    message.result_code = code;
-    message.error_code = error;
-    messages_.enqueue(move(message));
-}
-
 void NetworkManager::set_network_thread_policy() {
     // Main and Network are peers: SCHED_OTHER priority 0, nice 0.
     sched_param normal_priority{};
@@ -125,6 +93,99 @@ void NetworkManager::set_network_thread_policy() {
                   << '\n';
     }
 
+}
+
+// ==================================================================
+// CONTROLREPLYQUEUE: STORAGE, MAIN SEND AND NETWORK TAKE
+// ==================================================================
+
+void ControlReplyQueue::enqueue(vector<uint8_t> frame) {
+    PthreadLock lock(mutex_); // Lock the reply FIFO against simultaneous Network reads.
+    // QUEUE SEND (Main): add this serialized reply at the BACK of the FIFO.
+    queue_.push_back(move(frame)); // Transfer this frame to the newest end; unlock on return.
+}
+
+bool ControlReplyQueue::try_dequeue(vector<uint8_t>& frame) {
+    PthreadLock lock(mutex_); // Protect the empty check, front item and removal together.
+    if (queue_.empty()) {
+        return false; // No waiting reply; Network may check DataQueue instead.
+    }
+    // QUEUE TAKE (Network): take the oldest reply from the FRONT.
+    // try_dequeue returns false when empty; its mutex uses an ordinary short lock.
+    frame = move(queue_.front()); // Network now owns the oldest frame's byte vector.
+    queue_.pop_front(); // Remove that one queue entry so it cannot be sent twice.
+    return true; // Release the mutex before Network performs the TCP send.
+}
+
+void ControlReplyQueue::clear() {
+    PthreadLock lock(mutex_); // Clear atomically relative to senders/receivers.
+    queue_.clear(); // Drop waiting replies during a GUI connection change.
+}
+
+// CONTROL: Main -> ControlReplyQueue -> Network TCP send. This preserves reply order.
+void NetworkManager::queue_control(vector<uint8_t> frame) {
+    control_replies_.enqueue(move(frame));
+}
+
+// Main may call this method: queue the frame rather than writing from Main.
+bool NetworkManager::sendStatus(const phono::protocol::Status& status) {
+    queue_control(phono::protocol::make_status_packet(status));
+    return true;
+}
+
+bool NetworkManager::sendFileList(uint32_t cursor,
+                                 const vector<phono::protocol::FileEntry>& entries) {
+    queue_control(phono::protocol::make_file_list_packet(cursor, entries));
+    return true;
+}
+
+// ==================================================================
+// COMMANDQUEUE: NETWORK REPORTS CONNECTION EVENTS TO MAIN
+// ==================================================================
+
+void NetworkManager::post_network_event(WorkerResultCode code, uint8_t error) {
+    MainMessage message;
+    message.kind = MessageKind::WorkerResult;
+    if (error != 0) {
+        message.kind = MessageKind::WorkerError;
+    }
+    message.result_code = code;
+    message.error_code = error;
+    // QUEUE SEND: connection/startup events also go to Main's CommandQueue.
+    messages_.enqueue(move(message));
+}
+
+// ==================================================================
+// OUTGOING FRAMES: CONTROLREPLYQUEUE FIRST, THEN DATAQUEUE
+// ==================================================================
+
+// FLOWCHART: select ControlReplyQueue first, otherwise the latest DataQueue frame.
+// Complete this frame before receiving the next command or selecting another frame.
+bool NetworkManager::send_next_frame(int socket_fd) {
+    vector<uint8_t> control;
+    // QUEUE RECEIVE: take a reliable control reply before ordinary telemetry.
+    if (control_replies_.try_dequeue(control)) {
+        return send_all(socket_fd, control);
+    } else {
+        Telemetry packet;
+        // telemetry_ aliases SystemController::data_queue_: one latest snapshot.
+        if (telemetry_.try_dequeue(packet)) {
+            try {
+                return sendData(packet);
+            } catch (const exception& error) {
+                cerr << "Cannot serialize telemetry: " << error.what() << '\n';
+                post_network_event(
+                    WorkerResultCode::NetworkFailed,
+                    static_cast<uint8_t>(phono::protocol::Error::ProtocolError));
+                return false;
+            }
+        }
+    }
+    return true; // Nothing waiting to send is also a normal iteration.
+}
+
+bool NetworkManager::sendData(const Telemetry& packet) {
+    return send_all(client_fd_, phono::protocol::make_data_packet(packet.waveform, packet.spectrum));
 }
 
 // A TCP write can be partial: finish this frame before another frame is sent.
@@ -179,64 +240,9 @@ bool NetworkManager::send_all(int socket_fd,
     return bytes_sent == frame.size();
 }
 
-// FLOWCHART: select ControlReplyQueue first, otherwise the latest DataQueue frame.
-// Complete this frame before receiving the next command or selecting another frame.
-bool NetworkManager::send_next_frame(int socket_fd) {
-    vector<uint8_t> control;
-    if (control_replies_.try_dequeue(control)) {
-        return send_all(socket_fd, control);
-    } else {
-        Telemetry packet;
-        if (telemetry_.try_dequeue(packet)) {
-            try {
-                return sendData(packet);
-            } catch (const exception& error) {
-                cerr << "Cannot serialize telemetry: " << error.what() << '\n';
-                post_network_event(
-                    WorkerResultCode::NetworkFailed,
-                    static_cast<uint8_t>(phono::protocol::Error::ProtocolError));
-                return false;
-            }
-        }
-    }
-    return true; // Nothing waiting to send is also a normal iteration.
-}
-
-// One GUI client: send one control/telemetry frame, then check for incoming commands.
-void NetworkManager::serve_client(int socket_fd) {
-    timeval timeout{};
-    timeout.tv_usec = 10000;
-    if (::setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                     sizeof(timeout)) != 0 ||
-        ::setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                     sizeof(timeout)) != 0) {
-        cerr << "Cannot configure client socket timeouts: "
-                  << strerror(errno) << '\n';
-        return;
-    }
-
-    bytes_received_ = 0;
-    client_alive_ = true;
-    while (client_alive_ && !stop_requested_.load() && running.load()) {
-        if (!send_next_frame(socket_fd)) {
-            break;
-        }
-
-        pollfd event{socket_fd, POLLIN, 0};
-        const auto ready = ::poll(&event, 1, 10);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            cerr << "Client poll: " << strerror(errno) << '\n';
-            break;
-        }
-        if (ready == 0) continue;
-        if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
-        if (!(event.revents & POLLIN)) continue;
-
-        phono::protocol::CommandPacket command;
-        if (receiveCommand(command)) messages_.enqueue(command);
-    }
-}
+// ==================================================================
+// TCP LISTENER AND INCOMING COMMANDS
+// ==================================================================
 
 bool NetworkManager::startListening() {
     /* API: ::socket
@@ -314,21 +320,47 @@ bool NetworkManager::receiveCommand(phono::protocol::CommandPacket& command) {
     return true;
 }
 
-bool NetworkManager::sendData(const Telemetry& packet) {
-    return send_all(client_fd_, phono::protocol::make_data_packet(packet.waveform, packet.spectrum));
+// One GUI client: send one control/telemetry frame, then check for incoming commands.
+void NetworkManager::serve_client(int socket_fd) {
+    timeval timeout{};
+    timeout.tv_usec = 10000;
+    if (::setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                     sizeof(timeout)) != 0 ||
+        ::setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                     sizeof(timeout)) != 0) {
+        cerr << "Cannot configure client socket timeouts: "
+                  << strerror(errno) << '\n';
+        return;
+    }
+
+    bytes_received_ = 0;
+    client_alive_ = true;
+    while (client_alive_ && !stop_requested_.load() && running.load()) {
+        if (!send_next_frame(socket_fd)) {
+            break;
+        }
+
+        pollfd event{socket_fd, POLLIN, 0};
+        const auto ready = ::poll(&event, 1, 10);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            cerr << "Client poll: " << strerror(errno) << '\n';
+            break;
+        }
+        if (ready == 0) continue;
+        if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(event.revents & POLLIN)) continue;
+
+        phono::protocol::CommandPacket command;
+        // QUEUE SEND: received TCP bytes have become a complete CommandPacket.
+        // enqueue wraps it as MainMessage::GuiCommand and signals Main's queue.
+        if (receiveCommand(command)) messages_.enqueue(command);
+    }
 }
 
-// Main may call this method: queue the frame rather than writing from Main.
-bool NetworkManager::sendStatus(const phono::protocol::Status& status) {
-    queue_control(phono::protocol::make_status_packet(status));
-    return true;
-}
-
-bool NetworkManager::sendFileList(uint32_t cursor,
-                                 const vector<phono::protocol::FileEntry>& entries) {
-    queue_control(phono::protocol::make_file_list_packet(cursor, entries));
-    return true;
-}
+// ==================================================================
+// WORKER LOOP: ACCEPT, SERVE AND CLEAN UP EACH CLIENT
+// ==================================================================
 
 // This pthread is the sole owner of server_fd_ and client_fd_.
 // FLOWCHART: th_Network part 1 -> listen/accept -> serve_client (parts 2-3).
