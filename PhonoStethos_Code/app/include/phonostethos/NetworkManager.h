@@ -27,6 +27,17 @@
  * - threadEntry(): recover the object pointer passed to pthread_create and call its worker loop.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/CommandQueue.h" // Include the CommandQueue class/types used here; defines MainMessage and the FIFO consumed by th_Main.
@@ -83,19 +94,15 @@ public: // The class operations callable by other code.
     bool connected() const; // Read whether Network currently has a GUI client.
 
 private: // Internal helpers and state used by this class.
+    // Worker loop follows the thread flowchart.
     void run(); // Execute this class's thread loop in the order shown in its flowchart.
-    void serve_client(int socket_fd); // Alternate one outgoing frame with command reception for one connected GUI.
-    void set_network_thread_policy(); // Request CPU 3 affinity and SCHED_OTHER priority 0 with nice 0.
-    bool send_all(int socket_fd, const vector<uint8_t>& frame); // Retry partial TCP sends using an offset and a cumulative deadline.
 
     const Options& options_; // Declare options for this class instance.
     // SAME SHARED OBJECTS as SystemController::command_queue_ and data_queue_.
-    void post_network_event(WorkerResultCode code, uint8_t error = 0); // Send a MainMessage.
     CommandQueue& messages_; // Network sends GUI commands/connection events -> Main.
     DataQueue& telemetry_;   // Network takes the latest AudioDSP visualization.
     // ACTUAL OUTGOING QUEUE OBJECT: Main calls queue_control() to fill it;
     // Network calls send_next_frame() to consume it before ordinary telemetry.
-    bool send_next_frame(int socket_fd); // Take a reply first, otherwise the latest telemetry.
     ControlReplyQueue control_replies_; // Declare control replies for this class instance.
     int server_fd_ = -1; // Initialize server fd to -1.
     int client_fd_ = -1; // Initialize client fd to -1.
@@ -104,8 +111,15 @@ private: // Internal helpers and state used by this class.
     bool client_alive_ = false; // Initialize client alive to false.
     atomic<bool> stop_requested_{false}; // Declare stop requested for this class instance.
     atomic<bool> connected_{false}; // Declare connected for this class instance.
-    static void* threadEntry(void* context); // Recover the object pointer passed to pthread_create and call its worker loop.
     pthread_t worker_{}; // POSIX pthread handle created by start and later passed to pthread_join.
     bool worker_started_ = false; // Track whether a pthread was actually created and must be joined.
+    // ==================== PRIVATE HELPER METHODS ====================
+    void serve_client(int socket_fd); // Alternate one outgoing frame with command reception for one connected GUI.
+    void set_network_thread_policy(); // Request CPU 3 affinity and SCHED_OTHER priority 0 with nice 0.
+    bool send_all(int socket_fd, const vector<uint8_t>& frame); // Retry partial TCP sends using an offset and a cumulative deadline.
+    void post_network_event(WorkerResultCode code, uint8_t error = 0); // Send a MainMessage.
+    bool send_next_frame(int socket_fd); // Take a reply first, otherwise the latest telemetry.
+    static void* threadEntry(void* context); // Recover the object pointer passed to pthread_create and call its worker loop.
+
 }; // End this block, declaration or argument list.
 }  // namespace phono_app

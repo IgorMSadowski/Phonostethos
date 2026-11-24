@@ -4,13 +4,9 @@
  * CONNECTIONS: FileIoManager.h declares the class; FileIoManager.cpp implements it. SystemController posts one-slot mailbox requests. FileIO pops recording samples, pushes playback samples and reports completion through CommandQueue.
  *
  * FUNCTIONS:
- * - ~FileIoManager(): release this object's resources after its users have stopped.
+ * Main methods are listed first; private helpers are implemented at the end.
  * - FileIoManager(): connect the owned resources/references used by this class.
- * - unescape_mount_path(): decode Linux mountinfo escape sequences in a pathname.
- * - mounted_source(): read mountinfo to identify the device behind the storage mount point.
- * - mounts(): mounts.
- * - fields(): fields.
- * - storage_ready(): check the mount/path requirement, including the explicit host-test override.
+ * - ~FileIoManager(): release this object's resources after its users have stopped.
  * - openRecordFile(): create a new WAV exclusively so an existing recording is never overwritten.
  * - openPlaybackFile(): open the resolved WAV and reject an unsupported channel count, rate or sample format.
  * - writeChunk(): write the requested PCM16 sample count through libsndfile and return the actual count.
@@ -22,6 +18,7 @@
  * - start(): create this worker pthread once and retain its handle for joining.
  * - stop(): request teardown and join workers before destroying their shared resources.
  * - request(): put one control record into the worker mailbox if its slot is free.
+ * - run(): execute this class's thread loop in the order shown in its flowchart.
  * - threadEntry(): recover the object pointer passed to pthread_create and call its worker loop.
  * - set_file_thread_policy(): request CPU 2 affinity and SCHED_FIFO priority 50.
  * - take_request(): copy a mailbox request locally and free its slot under the mailbox mutex.
@@ -36,8 +33,26 @@
  * - write_recording(): pop recorded samples and write/check them outside the sample-buffer mutex.
  * - read_playback(): read WAV samples and push them into the playback buffer for AudioDSP.
  * - storage_available(): check whether the configured storage path is currently usable.
- * - run(): execute this class's thread loop in the order shown in its flowchart.
  */
+
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Condition waits: mutex release/reacquisition and absolute timeouts:
+// https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3p.html
+// Linux pthread CPU affinity:
+// https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
 
 #include "phonostethos/FileIoManager.h" // Include the FileIoManager class/types used here; implements th_FileIO: WAV recording/playback, archive management and FAT32 USB storage operations.
 
@@ -61,93 +76,12 @@
 using namespace std; // Allow the names in this namespace without repeating its prefix.
 
 namespace phono_app { // Keep these declarations in the project namespace and avoid global name collisions.
-namespace { // Keep these declarations in the project namespace and avoid global name collisions.
-string unescape_mount_path(string path) { // Decode Linux mountinfo escape sequences in a pathname.
-    // /proc/mountinfo escapes spaces, tabs, newlines and backslashes.
-    const char* codes[4] = {"\\040", "\\011", "\\012", "\\134"}; // Initialize codes to {"\\040", "\\011", "\\012", "\\134"}.
-    const char characters[4] = {' ', '\t', '\n', '\\'}; // Initialize characters to {' ', '\t', '\n', '\\'}.
-    for (int index = 0; index < 4; index++) { // Visit the specified items/indexes in order.
-        size_t position = path.find(codes[index]); // Initialize position to path.find(codes[index]).
-        while (position != string::npos) { // Repeat this block while its condition remains true; recheck shared state on each pass.
-            path.replace(position, 4, 1, characters[index]); // Call path.replace with the arguments shown here.
-            position = path.find(codes[index], position + 1); // Set position to path.find(codes[index], position + 1).
-        } // End this block, declaration or argument list.
-    } // End this block, declaration or argument list.
-    return path; // Return path to the caller.
-} // End this block, declaration or argument list.
+namespace {
+string unescape_mount_path(string path); // Defined with the helpers below.
+string mounted_source(const filesystem::path& path); // Defined with the helpers below.
+}
 
-string mounted_source(const filesystem::path& path) { // Read mountinfo to identify the device behind the storage mount point.
-    error_code error; // Declare error for this operation.
-    const auto canonical_path = filesystem::canonical(path, error); // Initialize canonical path to filesystem::canonical(path, error).
-    if (error) { // Test the condition error.
-        return {}; // Return {} to the caller.
-    } // End this block, declaration or argument list.
-    ifstream mounts("/proc/self/mountinfo"); // Complete the call above with these remaining arguments.
-    if (!mounts) { // Test the condition !mounts.
-        return {}; // Return {} to the caller.
-    } // End this block, declaration or argument list.
-    string line; // Declare line for this operation.
-    while (getline(mounts, line)) { // Repeat this block while its condition remains true; recheck shared state on each pass.
-        istringstream fields(line); // Complete the call above with these remaining arguments.
-        string field; // Declare field for this operation.
-        bool valid_line = true; // Initialize valid line to true.
-        for (int index = 0; index < 5; ++index) { // Visit the specified items/indexes in order.
-            if (!(fields >> field)) { // Test the condition !(fields >> field).
-                valid_line = false; // Set valid line to false.
-                break; // Leave the current loop or switch branch.
-            } // End this block, declaration or argument list.
-        } // End this block, declaration or argument list.
-        if (!valid_line || // Test the condition !valid_line ||.
-            unescape_mount_path(field) != canonical_path.string()) { // Decode Linux mountinfo escape sequences in a pathname.
-            continue; // Skip the rest of this pass and check the next loop iteration.
-        } // End this block, declaration or argument list.
-        while (fields >> field && field != "-") {} // Repeat this block while its condition remains true; recheck shared state on each pass.
-        string filesystem_type; // Declare filesystem type for this operation.
-        string source; // Declare source for this operation.
-        if (fields >> filesystem_type >> source) { // Test the condition fields >> filesystem_type >> source.
-            return source; // Return source to the caller.
-        } // End this block, declaration or argument list.
-    } // End this block, declaration or argument list.
-    return {}; // Return {} to the caller.
-} // End this block, declaration or argument list.
-}  // namespace
-
-bool storage_ready(const Options& options) { // Check the mount/path requirement, including the explicit host-test override.
-    error_code error; // Declare error for this operation.
-    if (!filesystem::is_directory(options.storage, error) || error) { // Test the condition !filesystem::is_directory(options.storage, error) || error.
-        return false; // Report failure or no available item to the caller.
-    } // End this block, declaration or argument list.
-    if (!options.require_mounted_storage) { // Test the condition !options.require_mounted_storage.
-        return true; // Report success, readiness or an available result to the caller.
-    } // End this block, declaration or argument list.
-
-    const auto storage_path = filesystem::canonical(options.storage, error); // Initialize storage path to filesystem::canonical(options.storage, error).
-    if (error) { // Test the condition error.
-        return false; // Report failure or no available item to the caller.
-    } // End this block, declaration or argument list.
-    ifstream mounts("/proc/self/mountinfo"); // Complete the call above with these remaining arguments.
-    if (!mounts) { // Test the condition !mounts.
-        return false; // Report failure or no available item to the caller.
-    } // End this block, declaration or argument list.
-
-    string line; // Declare line for this operation.
-    while (getline(mounts, line)) { // Repeat this block while its condition remains true; recheck shared state on each pass.
-        istringstream fields(line); // Complete the call above with these remaining arguments.
-        string field; // Declare field for this operation.
-        bool valid_line = true; // Initialize valid line to true.
-        for (int index = 0; index < 5; ++index) { // Visit the specified items/indexes in order.
-            if (!(fields >> field)) { // Test the condition !(fields >> field).
-                valid_line = false; // Set valid line to false.
-                break; // Leave the current loop or switch branch.
-            } // End this block, declaration or argument list.
-        } // End this block, declaration or argument list.
-        if (valid_line && // Test the condition valid_line &&.
-            unescape_mount_path(field) == storage_path.string()) { // Decode Linux mountinfo escape sequences in a pathname.
-            return true; // Report success, readiness or an available result to the caller.
-        } // End this block, declaration or argument list.
-    } // End this block, declaration or argument list.
-    return false; // Report failure or no available item to the caller.
-} // End this block, declaration or argument list.
+// ==================== OBJECT SETUP ====================
 
 FileIoManager::FileIoManager( // Begin this function/widget call; its arguments follow below.
     const Options& options, CommandQueue& messages, // Declare options for this operation.
@@ -167,6 +101,8 @@ FileIoManager::~FileIoManager() { // Finish the parameters/condition and enter t
     pthread_mutex_destroy(&mailbox_mutex_); // Release this initialized mutex after its users have stopped.
 } // End this function or local scope.
 
+// ==================== MAIN METHODS - REPORT ORDER ====================
+
 // Called only by th_FileIO: no other thread touches these SNDFILE handles.
 bool FileIoManager::openRecordFile(const string& filename) { // Create a new WAV exclusively so an existing recording is never overwritten.
     using phono::protocol::Error; // Bring this named type or value into the current scope.
@@ -175,6 +111,7 @@ bool FileIoManager::openRecordFile(const string& filename) { // Create a new WAV
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: ::open
+     * Documentation: https://man7.org/linux/man-pages/man2/open.2.html
      * Open the path with the requested flags. Returns a file descriptor or -1 with errno. O_EXCL with O_CREAT prevents overwriting an existing recording.
      */
     recording_fd_ = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600); // Set recording fd to ::open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600).
@@ -187,12 +124,14 @@ bool FileIoManager::openRecordFile(const string& filename) { // Create a new WAV
     info.channels = 1; // Set info.channels to 1.
     info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16; // Set info.format to SF_FORMAT_WAV | SF_FORMAT_PCM_16.
     /* API: sf_open_fd
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Create a libsndfile handle around an open descriptor. Supply read/write mode, SF_INFO and whether libsndfile should close the descriptor. This project checks and closes its own descriptor separately.
      */
     recording_file_ = sf_open_fd(recording_fd_, SFM_WRITE, &info, SF_FALSE); // Set recording file to sf_open_fd(recording_fd_, SFM_WRITE, &info, SF_FALSE).
     if (!recording_file_) { // Test the condition !recording_file_.
         const int open_error = errno; // Initialize open error to errno.
         /* API: ::close
+         * Documentation: https://man7.org/linux/man-pages/man2/close.2.html
          * Release a descriptor after its owner has finished using it. Set the stored descriptor to -1 so it cannot be reused accidentally.
          */
         ::close(recording_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
@@ -236,6 +175,7 @@ bool FileIoManager::openPlaybackFile(const string& filename) { // Open the resol
 
 sf_count_t FileIoManager::writeChunk(const int16_t* data, sf_count_t count) { // Write the requested PCM16 sample count through libsndfile and return the actual count.
     /* API: sf_write_short
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Write the requested number of PCM16 sample items. Check that the returned count equals the requested count before accepting a successful recording write.
      */
     if (recording_file_ == nullptr) { // Test the condition recording_file_ == nullptr.
@@ -246,6 +186,7 @@ sf_count_t FileIoManager::writeChunk(const int16_t* data, sf_count_t count) { //
 
 sf_count_t FileIoManager::readChunk(int16_t* data, sf_count_t count) { // Read at most the requested PCM16 sample count through libsndfile.
     /* API: sf_read_short
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Read PCM16 sample items. A short count can be the final block, zero can be EOF, and sf_error distinguishes a file error.
      */
     if (playback_file_ == nullptr) { // Test the condition playback_file_ == nullptr.
@@ -280,10 +221,12 @@ bool FileIoManager::closeFile() { // Check libsndfile flush/finalization and clo
     bool success = true; // Initialize success to true.
     if (recording_file_) { // Test the condition recording_file_.
         /* API: sf_write_sync
+         * Documentation: https://libsndfile.github.io/libsndfile/api.html
          * Flush libsndfile buffered recording data. Check sf_error and the final sf_close result as well.
          */
         sf_write_sync(recording_file_); // Call sf_write_sync with the arguments shown here.
         /* API: sf_error
+         * Documentation: https://libsndfile.github.io/libsndfile/api.html
          * Read the libsndfile error associated with a handle. Compare with SF_ERR_NO_ERROR before claiming a write/finalization succeeded.
          */
         if (sf_error(recording_file_) != SF_ERR_NO_ERROR) { // Test the condition sf_error(recording_file_) != SF_ERR_NO_ERROR.
@@ -291,6 +234,7 @@ bool FileIoManager::closeFile() { // Check libsndfile flush/finalization and clo
             success = false; // Set success to false.
         } // End this block, declaration or argument list.
         /* API: sf_close
+         * Documentation: https://libsndfile.github.io/libsndfile/api.html
          * Finalize the WAV header and release the libsndfile handle. Zero means success. FileIO owns this handle.
          */
         if (sf_close(recording_file_) != 0) { // Test the condition sf_close(recording_file_) != 0.
@@ -350,11 +294,13 @@ bool FileIoManager::ejectStorage() { // Synchronize and unmount storage in FileI
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: ::syncfs
+     * Documentation: https://man7.org/linux/man-pages/man2/syncfs.2.html
      * Synchronize the filesystem containing this open descriptor. Check its result before allowing safe USB removal.
      */
     const bool synced = ::syncfs(fd) == 0; // Initialize synced to ::syncfs(fd) == 0.
     const bool closed = ::close(fd) == 0; // Initialize closed to ::close(fd) == 0.
     /* API: ::umount2
+     * Documentation: https://man7.org/linux/man-pages/man2/umount2.2.html
      * Unmount the FAT32 mount point. Zero means success. Failure must not produce a safe-to-remove acknowledgement.
      */
     if (!synced || !closed || ::umount2(options_.storage.c_str(), 0) != 0) { // Test the condition !synced || !closed || ::umount2(options_.storage.c_str(), 0) != 0.
@@ -369,6 +315,7 @@ bool FileIoManager::start() { // Create this worker pthread once and retain its 
         return true; // Report success, readiness or an available result to the caller.
     } // End this block, declaration or argument list.
     /* API: pthread_create
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Start a POSIX worker. Pass its pthread_t address, attributes (NULL for defaults), entry callback and context pointer. Returns 0 or an error number.
      */
     const int result = pthread_create(&worker_, nullptr, &FileIoManager::threadEntry, this); // Initialize result to pthread_create(&worker_, nullptr, &FileIoManager::threadEntry, this).
@@ -391,11 +338,13 @@ void FileIoManager::stop() { // Request teardown and join workers before destroy
     recording_.stop_producing(); // Close this sample buffer's production gate while preserving accepted samples for draining.
     playback_.stop_producing(); // Close this sample buffer's production gate while preserving accepted samples for draining.
     /* API: pthread_cond_broadcast
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Wake all waiters so each can recheck the protected stop/data condition.
      */
     pthread_cond_broadcast(&mailbox_ready_); // Wake all waiters so each can recheck its protected data/stop predicate.
     if (worker_started_) { // Test the condition worker_started_.
         /* API: pthread_join
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Wait for this worker to return before releasing the objects it uses. Pass the pthread handle and NULL when its return value is unused.
          */
         pthread_join(worker_, nullptr); // Call pthread_join with the arguments shown here.
@@ -416,6 +365,7 @@ bool FileIoManager::request(Request request) { // Put one control record into th
         has_mailbox_request_ = true; // Publish that this slot contains a request.
     } // End this block, declaration or argument list.
     /* API: pthread_cond_signal
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Wake one thread waiting on this condition variable. Change the protected condition under its mutex first. The signal itself does not store data.
      */
     // Wake FileIO if it is in its idle condition wait. The request is in mailbox_,
@@ -423,6 +373,67 @@ bool FileIoManager::request(Request request) { // Put one control record into th
     pthread_cond_signal(&mailbox_ready_); // Wake one waiter; the protected record or sample buffer stores the actual data.
     return true; // Accepted into the slot; the operation will complete later.
 } // End this function or local scope.
+
+// ==================== THREAD FLOW ====================
+
+// This pthread owns all WAV handles and filesystem operations.
+// FLOWCHART: th_FileIO -> take control request -> pop recording / push playback.
+void FileIoManager::run() { // Execute this class's thread loop in the order shown in its flowchart.
+    set_file_thread_policy(); // Request CPU 2 affinity and SCHED_FIFO priority 50.
+    if (storage_available()) mounted_device_ = mounted_source(options_.storage); // Test the condition storage_available(). If true, set mounted device to mounted_source(options_.storage).
+    post_storage_status(WorkerResultCode::FILEIO_READY, 0); // Derive storage capabilities in FileIO and report them to Main.
+    while (true) { // Repeat this block while its condition remains true; recheck shared state on each pass.
+        Request request{}; // Local control record; shared mailbox data stays protected.
+        int mailbox_result = take_request(request); // 1 = request, 0 = no request, -1 = stop.
+        if (mailbox_result < 0) break; // Worker is stopping and has no pending mailbox item.
+        if (mailbox_result > 0) { // Test the condition mailbox_result > 0.
+            if (request.kind == RequestKind::OPEN_RECORD) { // Test the condition request.kind == RequestKind::OPEN_RECORD.
+                recording_operation_ = request.operation_id; // Set recording operation to request.operation_id.
+            } // End this block, declaration or argument list.
+            // Mailbox mutex is already released. Slow file calls must not hold it.
+            process_request(request); // Dispatch a FileIO control request after releasing the mailbox mutex.
+        } // End this block, declaration or argument list.
+
+        if (recording_active_ && recording_file_ != nullptr) { // Test the condition recording_active_ && recording_file_ != nullptr.
+            if (!storage_available()) { // Test the condition !storage_available().
+                recording_.stop_producing(); // Close this sample buffer's production gate while preserving accepted samples for draining.
+                recording_.clear(); // Discard the previous contents/state of this object.
+                sf_close(recording_file_); // Call sf_close with the arguments shown here.
+                recording_file_ = nullptr; // Set recording file to nullptr.
+                if (recording_fd_ >= 0) ::close(recording_fd_); // Test the condition recording_fd_ >= 0. If true, supply the next constructor initializer or argument.
+                recording_fd_ = -1; // Set recording fd to -1.
+                recording_active_ = false; // Set recording active to false.
+                recording_error_.store( // Publish the new shared recording error value atomically.
+                    static_cast<uint8_t>(phono::protocol::Error::StorageLost)); // Complete the call above with these remaining arguments.
+                post_result(WorkerResultCode::RECORD_CLOSED, // Call post_result with the arguments shown here.
+                            recording_operation_, // Name this field, choice or argument: recording operation.
+                            static_cast<uint8_t>( // Begin this function/widget call; its arguments follow below.
+                                phono::protocol::Error::StorageLost)); // Complete the call above with these remaining arguments.
+            } else { // Follow the alternative path when the previous condition is false.
+                if (!write_recording()) { // Test the condition !write_recording().
+                    Request close_request; // Declare close request for this operation.
+                    close_request.kind = RequestKind::CLOSE_RECORD; // Set close request.kind to RequestKind::CLOSE_RECORD.
+                    close_request.operation_id = recording_operation_; // Set close request.operation id to recording_operation_.
+                    process_request(close_request); // Dispatch a FileIO control request after releasing the mailbox mutex.
+                } // End this block, declaration or argument list.
+            } // End this block, declaration or argument list.
+        } // End this block, declaration or argument list.
+        if (playback_active_) { // Test the condition playback_active_.
+            read_playback(); // Read WAV samples and push them into the playback buffer for AudioDSP.
+        } // End this block, declaration or argument list.
+    } // End this block, declaration or argument list.
+    if (recording_file_ != nullptr) { // Test the condition recording_file_ != nullptr.
+        while (!recording_.isEmpty() && // Repeat this block while its condition remains true; recheck shared state on each pass.
+               write_recording()) {} // Call write_recording with the arguments shown here.
+        sf_write_sync(recording_file_); // Call sf_write_sync with the arguments shown here.
+        sf_close(recording_file_); // Call sf_close with the arguments shown here.
+    } // End this block, declaration or argument list.
+    if (recording_fd_ >= 0) ::close(recording_fd_); // Test the condition recording_fd_ >= 0. If true, supply the next constructor initializer or argument.
+    if (playback_file_ != nullptr) sf_close(playback_file_); // Test the condition playback_file_ != nullptr. If true, call sf_close with the arguments shown here.
+    if (playback_fd_ >= 0) ::close(playback_fd_); // Test the condition playback_fd_ >= 0. If true, supply the next constructor initializer or argument.
+} // End this function or local scope.
+
+// ==================== PRIVATE HELPERS ====================
 
 void* FileIoManager::threadEntry(void* context) { // Recover the object pointer passed to pthread_create and call its worker loop.
     static_cast<FileIoManager*>(context)->run(); // Complete the call above with these remaining arguments.
@@ -435,9 +446,11 @@ void FileIoManager::set_file_thread_policy() { // Request CPU 2 affinity and SCH
     CPU_SET(2, &cpus); // Call CPU_SET with the arguments shown here.
     const int affinity_result = // Start initializing this local value from the expression on the next line.
         /* API: pthread_setaffinity_np
+         * Documentation: https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
          * Ask Linux to run this pthread on the CPUs in cpu_set_t. pthread_self identifies the current worker. Check the returned error number.
          */
         /* API: pthread_self
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Return the calling pthread handle, used when setting this worker's affinity or scheduling policy.
          */
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Call pthread_setaffinity_np with the arguments shown here.
@@ -449,6 +462,7 @@ void FileIoManager::set_file_thread_policy() { // Request CPU 2 affinity and SCH
     priority.sched_priority = 50; // Set priority.sched priority to 50.
     const int scheduling_result = // Start initializing this local value from the expression on the next line.
         /* API: pthread_setschedparam
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Request the scheduling policy and sched_priority stored in sched_param. FIFO 80 is AudioDSP and FIFO 50 is FileIO. SCHED_OTHER requires priority 0.
          */
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &priority); // Call pthread_setschedparam with the arguments shown here.
@@ -516,6 +530,7 @@ void FileIoManager::process_request(const Request& request) { // Dispatch a File
             struct stat metadata {}; // Allocate file metadata storage for the checked stat/fstat call.
             const auto path = options_.storage / request.identity.basename; // Initialize path to options_.storage / request.identity.basename.
             /* API: lstat
+             * Documentation: https://man7.org/linux/man-pages/man2/lstat.2.html
              * Read path metadata without following its final symbolic link. Check the return and expected regular-file identity before file operations.
              */
             if (::lstat(path.c_str(), &metadata) != 0 || !same_file(request.identity, metadata)) { // Test the condition ::lstat(path.c_str(), &metadata) != 0 || !same_file(request.identity, metadata).
@@ -593,6 +608,7 @@ void FileIoManager::prepare_playback(const Request& request) { // Validate the s
     } // End this block, declaration or argument list.
     struct stat opened_metadata {}; // Allocate file metadata storage for the checked stat/fstat call.
     /* API: fstat
+     * Documentation: https://man7.org/linux/man-pages/man2/fstat.2.html
      * Read metadata for an open descriptor. Compare the saved archive identity before using a GUI file ID; a changed file must not be silently substituted.
      */
     if (::fstat(playback_fd_, &opened_metadata) != 0 || !same_file(request.identity, opened_metadata)) { // Test the condition ::fstat(playback_fd_, &opened_metadata) != 0 || !same_file(request.identity, opened_metadata).
@@ -686,6 +702,7 @@ void FileIoManager::mount_storage(const Request& request) { // Validate and moun
         return; // Leave this function; any local scoped locks are released.
     } // End this block, declaration or argument list.
     /* API: mount
+     * Documentation: https://man7.org/linux/man-pages/man2/mount.2.html
      * Mount the device on the configured directory with the selected filesystem/flags. Returns 0 or -1 with errno. FileIO performs this work outside audio/queue locks.
      */
     if (::mount(request.path.c_str(), options_.storage.c_str(), // Test the condition ::mount(request.path.c_str(), options_.storage.c_str(),.
@@ -900,62 +917,93 @@ bool FileIoManager::storage_available() const { // Check whether the configured 
     return !storage_removed_ && storage_ready(options_); // Return !storage_removed_ && storage_ready(options_) to the caller.
 } // End this function or local scope.
 
-// This pthread owns all WAV handles and filesystem operations.
-// FLOWCHART: th_FileIO -> take control request -> pop recording / push playback.
-void FileIoManager::run() { // Execute this class's thread loop in the order shown in its flowchart.
-    set_file_thread_policy(); // Request CPU 2 affinity and SCHED_FIFO priority 50.
-    if (storage_available()) mounted_device_ = mounted_source(options_.storage); // Test the condition storage_available(). If true, set mounted device to mounted_source(options_.storage).
-    post_storage_status(WorkerResultCode::FILEIO_READY, 0); // Derive storage capabilities in FileIO and report them to Main.
-    while (true) { // Repeat this block while its condition remains true; recheck shared state on each pass.
-        Request request{}; // Local control record; shared mailbox data stays protected.
-        int mailbox_result = take_request(request); // 1 = request, 0 = no request, -1 = stop.
-        if (mailbox_result < 0) break; // Worker is stopping and has no pending mailbox item.
-        if (mailbox_result > 0) { // Test the condition mailbox_result > 0.
-            if (request.kind == RequestKind::OPEN_RECORD) { // Test the condition request.kind == RequestKind::OPEN_RECORD.
-                recording_operation_ = request.operation_id; // Set recording operation to request.operation_id.
-            } // End this block, declaration or argument list.
-            // Mailbox mutex is already released. Slow file calls must not hold it.
-            process_request(request); // Dispatch a FileIO control request after releasing the mailbox mutex.
+namespace { // Keep these declarations in the project namespace and avoid global name collisions.
+string unescape_mount_path(string path) { // Decode Linux mountinfo escape sequences in a pathname.
+    // /proc/mountinfo escapes spaces, tabs, newlines and backslashes.
+    const char* codes[4] = {"\\040", "\\011", "\\012", "\\134"}; // Initialize codes to {"\\040", "\\011", "\\012", "\\134"}.
+    const char characters[4] = {' ', '\t', '\n', '\\'}; // Initialize characters to {' ', '\t', '\n', '\\'}.
+    for (int index = 0; index < 4; index++) { // Visit the specified items/indexes in order.
+        size_t position = path.find(codes[index]); // Initialize position to path.find(codes[index]).
+        while (position != string::npos) { // Repeat this block while its condition remains true; recheck shared state on each pass.
+            path.replace(position, 4, 1, characters[index]); // Call path.replace with the arguments shown here.
+            position = path.find(codes[index], position + 1); // Set position to path.find(codes[index], position + 1).
         } // End this block, declaration or argument list.
+    } // End this block, declaration or argument list.
+    return path; // Return path to the caller.
+} // End this block, declaration or argument list.
 
-        if (recording_active_ && recording_file_ != nullptr) { // Test the condition recording_active_ && recording_file_ != nullptr.
-            if (!storage_available()) { // Test the condition !storage_available().
-                recording_.stop_producing(); // Close this sample buffer's production gate while preserving accepted samples for draining.
-                recording_.clear(); // Discard the previous contents/state of this object.
-                sf_close(recording_file_); // Call sf_close with the arguments shown here.
-                recording_file_ = nullptr; // Set recording file to nullptr.
-                if (recording_fd_ >= 0) ::close(recording_fd_); // Test the condition recording_fd_ >= 0. If true, supply the next constructor initializer or argument.
-                recording_fd_ = -1; // Set recording fd to -1.
-                recording_active_ = false; // Set recording active to false.
-                recording_error_.store( // Publish the new shared recording error value atomically.
-                    static_cast<uint8_t>(phono::protocol::Error::StorageLost)); // Complete the call above with these remaining arguments.
-                post_result(WorkerResultCode::RECORD_CLOSED, // Call post_result with the arguments shown here.
-                            recording_operation_, // Name this field, choice or argument: recording operation.
-                            static_cast<uint8_t>( // Begin this function/widget call; its arguments follow below.
-                                phono::protocol::Error::StorageLost)); // Complete the call above with these remaining arguments.
-            } else { // Follow the alternative path when the previous condition is false.
-                if (!write_recording()) { // Test the condition !write_recording().
-                    Request close_request; // Declare close request for this operation.
-                    close_request.kind = RequestKind::CLOSE_RECORD; // Set close request.kind to RequestKind::CLOSE_RECORD.
-                    close_request.operation_id = recording_operation_; // Set close request.operation id to recording_operation_.
-                    process_request(close_request); // Dispatch a FileIO control request after releasing the mailbox mutex.
-                } // End this block, declaration or argument list.
+string mounted_source(const filesystem::path& path) { // Read mountinfo to identify the device behind the storage mount point.
+    error_code error; // Declare error for this operation.
+    const auto canonical_path = filesystem::canonical(path, error); // Initialize canonical path to filesystem::canonical(path, error).
+    if (error) { // Test the condition error.
+        return {}; // Return {} to the caller.
+    } // End this block, declaration or argument list.
+    ifstream mounts("/proc/self/mountinfo"); // Complete the call above with these remaining arguments.
+    if (!mounts) { // Test the condition !mounts.
+        return {}; // Return {} to the caller.
+    } // End this block, declaration or argument list.
+    string line; // Declare line for this operation.
+    while (getline(mounts, line)) { // Repeat this block while its condition remains true; recheck shared state on each pass.
+        istringstream fields(line); // Complete the call above with these remaining arguments.
+        string field; // Declare field for this operation.
+        bool valid_line = true; // Initialize valid line to true.
+        for (int index = 0; index < 5; ++index) { // Visit the specified items/indexes in order.
+            if (!(fields >> field)) { // Test the condition !(fields >> field).
+                valid_line = false; // Set valid line to false.
+                break; // Leave the current loop or switch branch.
             } // End this block, declaration or argument list.
         } // End this block, declaration or argument list.
-        if (playback_active_) { // Test the condition playback_active_.
-            read_playback(); // Read WAV samples and push them into the playback buffer for AudioDSP.
+        if (!valid_line || // Test the condition !valid_line ||.
+            unescape_mount_path(field) != canonical_path.string()) { // Decode Linux mountinfo escape sequences in a pathname.
+            continue; // Skip the rest of this pass and check the next loop iteration.
+        } // End this block, declaration or argument list.
+        while (fields >> field && field != "-") {} // Repeat this block while its condition remains true; recheck shared state on each pass.
+        string filesystem_type; // Declare filesystem type for this operation.
+        string source; // Declare source for this operation.
+        if (fields >> filesystem_type >> source) { // Test the condition fields >> filesystem_type >> source.
+            return source; // Return source to the caller.
         } // End this block, declaration or argument list.
     } // End this block, declaration or argument list.
-    if (recording_file_ != nullptr) { // Test the condition recording_file_ != nullptr.
-        while (!recording_.isEmpty() && // Repeat this block while its condition remains true; recheck shared state on each pass.
-               write_recording()) {} // Call write_recording with the arguments shown here.
-        sf_write_sync(recording_file_); // Call sf_write_sync with the arguments shown here.
-        sf_close(recording_file_); // Call sf_close with the arguments shown here.
+    return {}; // Return {} to the caller.
+} // End this block, declaration or argument list.
+}  // namespace
+
+bool storage_ready(const Options& options) { // Check the mount/path requirement, including the explicit host-test override.
+    error_code error; // Declare error for this operation.
+    if (!filesystem::is_directory(options.storage, error) || error) { // Test the condition !filesystem::is_directory(options.storage, error) || error.
+        return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
-    if (recording_fd_ >= 0) ::close(recording_fd_); // Test the condition recording_fd_ >= 0. If true, supply the next constructor initializer or argument.
-    if (playback_file_ != nullptr) sf_close(playback_file_); // Test the condition playback_file_ != nullptr. If true, call sf_close with the arguments shown here.
-    if (playback_fd_ >= 0) ::close(playback_fd_); // Test the condition playback_fd_ >= 0. If true, supply the next constructor initializer or argument.
-} // End this function or local scope.
+    if (!options.require_mounted_storage) { // Test the condition !options.require_mounted_storage.
+        return true; // Report success, readiness or an available result to the caller.
+    } // End this block, declaration or argument list.
+
+    const auto storage_path = filesystem::canonical(options.storage, error); // Initialize storage path to filesystem::canonical(options.storage, error).
+    if (error) { // Test the condition error.
+        return false; // Report failure or no available item to the caller.
+    } // End this block, declaration or argument list.
+    ifstream mounts("/proc/self/mountinfo"); // Complete the call above with these remaining arguments.
+    if (!mounts) { // Test the condition !mounts.
+        return false; // Report failure or no available item to the caller.
+    } // End this block, declaration or argument list.
+
+    string line; // Declare line for this operation.
+    while (getline(mounts, line)) { // Repeat this block while its condition remains true; recheck shared state on each pass.
+        istringstream fields(line); // Complete the call above with these remaining arguments.
+        string field; // Declare field for this operation.
+        bool valid_line = true; // Initialize valid line to true.
+        for (int index = 0; index < 5; ++index) { // Visit the specified items/indexes in order.
+            if (!(fields >> field)) { // Test the condition !(fields >> field).
+                valid_line = false; // Set valid line to false.
+                break; // Leave the current loop or switch branch.
+            } // End this block, declaration or argument list.
+        } // End this block, declaration or argument list.
+        if (valid_line && // Test the condition valid_line &&.
+            unescape_mount_path(field) == storage_path.string()) { // Decode Linux mountinfo escape sequences in a pathname.
+            return true; // Report success, readiness or an available result to the caller.
+        } // End this block, declaration or argument list.
+    } // End this block, declaration or argument list.
+    return false; // Report failure or no available item to the caller.
+} // End this block, declaration or argument list.
 
 
 }  // namespace phono_app

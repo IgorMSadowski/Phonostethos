@@ -8,6 +8,19 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// Linux pthread CPU affinity:
+// https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Request the project's exact thread settings on four short-lived test workers.
 // This does not inspect or change the running PhonoStethos server's threads.
@@ -36,6 +49,7 @@ static void* check_settings(void* argument) { // Finish the parameters/condition
     CPU_SET(wanted->core, &cpus); // Call CPU_SET with the arguments shown here.
     // API: pthread_setaffinity_np restricts this thread to the selected CPU core.
     /* API: pthread_self
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Return the calling pthread handle, used when setting this worker's affinity or scheduling policy.
      */
     int result = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Initialize result to pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus).
@@ -54,6 +68,7 @@ static void* check_settings(void* argument) { // Finish the parameters/condition
     if (wanted->policy == SCHED_OTHER) { // Test the condition wanted->policy == SCHED_OTHER.
         // Linux nice is per thread. gettid identifies this worker, not all workers.
         /* API: setpriority
+         * Documentation: https://man7.org/linux/man-pages/man2/setpriority.2.html
          * Set the calling Linux thread's nice value with PRIO_PROCESS and ID 0. Nice 0 is normal SCHED_OTHER weight; it is distinct from FIFO priority 50/80. Returns 0 or -1 with errno.
          */
         if (setpriority(PRIO_PROCESS, syscall(SYS_gettid), 0) != 0) { // Test the condition setpriority(PRIO_PROCESS, syscall(SYS_gettid), 0) != 0.

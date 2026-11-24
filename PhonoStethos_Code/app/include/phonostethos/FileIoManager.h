@@ -32,6 +32,21 @@
  * - threadEntry(): recover the object pointer passed to pthread_create and call its worker loop.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Condition waits: mutex release/reacquisition and absolute timeouts:
+// https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3p.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/CircularBuffer.h" // Include the CircularBuffer class/types used here; implements the shared PCM16 circular sample buffer.
@@ -91,9 +106,8 @@ public: // The class operations callable by other code.
     bool request(Request request); // Put one control record into the worker mailbox if its slot is free.
 
 private: // Internal helpers and state used by this class.
+    // Worker loop follows the thread flowchart.
     void run(); // Execute this class's thread loop in the order shown in its flowchart.
-    void set_file_thread_policy(); // Request CPU 2 affinity and SCHED_FIFO priority 50.
-    bool storage_available() const; // Check whether the configured storage path is currently usable.
 
     SNDFILE* recording_file_ = nullptr; // FileIO-only libsndfile recording handle; nullptr means no recording WAV is open.
     SNDFILE* playback_file_ = nullptr; // FileIO-only libsndfile playback handle; nullptr means no playback WAV is open.
@@ -108,12 +122,8 @@ private: // Internal helpers and state used by this class.
     const Options& options_; // Declare options for this class instance.
     // SHARED REFERENCES: SystemController passes these existing objects to FileIO.
     // RESULT QUEUE: both methods publish into Main's one shared CommandQueue.
-    void post_result(WorkerResultCode code, uint32_t operation_id, uint8_t error = 0); // Construct a MainMessage and enqueue completion or error through CommandQueue.
-    void post_storage_status(WorkerResultCode code, uint32_t operation_id); // Derive storage capabilities in FileIO and report them to Main.
     CommandQueue& messages_;     // FileIO enqueues results/errors -> Main.
     // SAMPLE BUFFERS: transfer data in these methods; do disk I/O outside their locks.
-    bool write_recording(); // Pop recording samples and write the WAV.
-    void read_playback();   // Read the WAV and push playback samples.
     CircularBuffer& recording_;  // Shared recording-enabled flag; the buffer gate is checked under its own mutex too.
     CircularBuffer& playback_;   // FileIO PUSHES samples consumed by AudioDSP.
 
@@ -124,14 +134,7 @@ private: // Internal helpers and state used by this class.
     // DO:   process_request() handles the local copy after releasing the mutex.
     // The condition variable wakes an idle FileIO worker; the actual request
     // remains in mailbox_. A signal itself does not contain or save a command.
-    int take_request(Request& request); // 1 = request, 0 = normal work, -1 = stop.
     // Request handlers below run after take_request() has released the mailbox mutex.
-    void process_request(const Request& request); // Dispatch a FileIO control request after releasing the mailbox mutex.
-    void finish_recording(const Request& request); // Drain and finalize a recording, then send its worker result to Main.
-    void prepare_playback(const Request& request); // Validate the selected file identity, open the WAV and prefill the playback buffer.
-    void list_archive(const Request& request); // Scan files and attach their identities to an archive-ready result.
-    void mount_storage(const Request& request); // Validate and mount a supported USB filesystem in FileIO.
-    void handle_removed_storage(const Request& request); // Stop affected file activity and report unavailable storage.
     pthread_mutex_t mailbox_mutex_{}; // Protect the FileIO request struct, occupied flag and stopping state.
     pthread_cond_t mailbox_ready_{};  // Wake an idle FileIO worker; the request itself remains in mailbox_.
     Request mailbox_{};               // The one shared control-message slot.
@@ -141,8 +144,23 @@ private: // Internal helpers and state used by this class.
     atomic<uint8_t> recording_error_{0}; // Remember a recording failure while remaining data is drained/finalized.
     string mounted_device_; // Device node currently associated with the configured storage mount point.
     bool storage_removed_ = false; // Remember surprise removal until the obsolete mount is released.
-    static void* threadEntry(void* context); // Recover the object pointer passed to pthread_create and call its worker loop.
     pthread_t worker_{}; // POSIX pthread handle created by start and later passed to pthread_join.
     bool worker_started_ = false; // Track whether a pthread was actually created and must be joined.
+    // ==================== PRIVATE HELPER METHODS ====================
+    void set_file_thread_policy(); // Request CPU 2 affinity and SCHED_FIFO priority 50.
+    bool storage_available() const; // Check whether the configured storage path is currently usable.
+    void post_result(WorkerResultCode code, uint32_t operation_id, uint8_t error = 0); // Construct a MainMessage and enqueue completion or error through CommandQueue.
+    void post_storage_status(WorkerResultCode code, uint32_t operation_id); // Derive storage capabilities in FileIO and report them to Main.
+    bool write_recording(); // Pop recording samples and write the WAV.
+    void read_playback();   // Read the WAV and push playback samples.
+    int take_request(Request& request); // 1 = request, 0 = normal work, -1 = stop.
+    void process_request(const Request& request); // Dispatch a FileIO control request after releasing the mailbox mutex.
+    void finish_recording(const Request& request); // Drain and finalize a recording, then send its worker result to Main.
+    void prepare_playback(const Request& request); // Validate the selected file identity, open the WAV and prefill the playback buffer.
+    void list_archive(const Request& request); // Scan files and attach their identities to an archive-ready result.
+    void mount_storage(const Request& request); // Validate and mount a supported USB filesystem in FileIO.
+    void handle_removed_storage(const Request& request); // Stop affected file activity and report unavailable storage.
+    static void* threadEntry(void* context); // Recover the object pointer passed to pthread_create and call its worker loop.
+
 }; // End this block, declaration or argument list.
 }  // namespace phono_app

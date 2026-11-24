@@ -7,6 +7,8 @@
  * - main(): start the program and hand execution to the application controller or GUI framework.
  */
 
+
+
 #include "my_application.h" // Include the GTK application type implemented by my_application.cc.
 
 int main(int argc, char** argv) { // Start the program and hand execution to the application controller or GUI framework.

@@ -9,6 +9,15 @@
  * - worker(): worker.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 // Exercise the real FileIO worker, its mailbox and both real circular buffers.
 #include "phonostethos/FileIoManager.h" // Include the FileIoManager class/types used here; implements th_FileIO: WAV recording/playback, archive management and FAT32 USB storage operations.
 #include <sndfile.h> // Include libsndfile WAV handles, format descriptors and PCM read/write APIs.
@@ -72,10 +81,12 @@ int main() { // Run this standalone test and return success only if its checks p
     short saved[1041]; // Declare saved for this operation.
     bool exact = info.frames == 1041 && info.samplerate == 8000 && info.channels == 1 && // Initialize exact to info.frames == 1041 && info.samplerate == 8000 && info.channels == 1 &&.
                  /* API: sf_read_short
+                  * Documentation: https://libsndfile.github.io/libsndfile/api.html
                   * Read at most the requested count of PCM16 samples into the supplied array. Returns the actual count; a short read needs EOF/error classification. Mono samples equal frames.
                   */
                  sf_read_short(file, saved, 1041) == 1041; // Call sf_read_short with the arguments shown here.
     /* API: sf_close
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Finalize/release a libsndfile handle. A nonzero result indicates a close/finalization error. This project closes retained POSIX descriptors separately.
      */
     if (sf_close(file) != 0) exact = false; // Test the condition sf_close(file) != 0. If true, set exact to false.
@@ -92,6 +103,7 @@ int main() { // Run this standalone test and return success only if its checks p
 
     struct stat metadata{}; // Allocate file metadata storage for the checked stat/fstat call.
     /* API: lstat
+     * Documentation: https://man7.org/linux/man-pages/man2/lstat.2.html
      * Read path metadata without following its final symbolic link. Check the return and expected regular-file identity before file operations.
      */
     if (lstat(path.c_str(), &metadata) != 0) return 1; // Test the condition lstat(path.c_str(), &metadata) != 0. If true, return 1 to the caller.

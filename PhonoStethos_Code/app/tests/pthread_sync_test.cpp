@@ -11,6 +11,13 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include "phonostethos/CircularBuffer.h" // Include the CircularBuffer class/types used here; implements the shared PCM16 circular sample buffer.
 #include "phonostethos/CommandQueue.h" // Include the CommandQueue class/types used here; defines MainMessage and the FIFO consumed by th_Main.
 
@@ -36,6 +43,7 @@ void* produce(void* context) { // Finish the parameters/condition and enter the 
         while (!transfer.buffer.push(samples.data(), samples.size())) { // Repeat this block while its condition remains true; recheck shared state on each pass.
             const timespec pause{0, 100000}; // Declare pause for this operation.
             /* API: nanosleep
+             * Documentation: https://man7.org/linux/man-pages/man2/nanosleep.2.html
              * Sleep for the relative timespec interval instead of spinning while idle. A signal may interrupt the sleep before the whole interval has elapsed.
              */
             nanosleep(&pause, nullptr); // Call nanosleep with the arguments shown here.

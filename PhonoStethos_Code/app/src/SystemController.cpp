@@ -4,9 +4,9 @@
  * CONNECTIONS: SystemController.h declares the coordinator and owned objects; SystemController.cpp implements it. main.cpp starts it. It owns both sample buffers, all three managers and the DSP/LED objects, and handles worker results without blocking on worker I/O.
  *
  * FUNCTIONS:
- * - ~SystemController(): release this object's resources after its users have stopped.
+ * Main methods are listed first; private helpers are implemented at the end.
  * - SystemController(): connect the owned resources/references used by this class.
- * - compare_file_names(): sort archive entries by basename for a stable display order.
+ * - ~SystemController(): release this object's resources after its users have stopped.
  * - initSystem(): prepare shared resources, create the three worker pthreads and check audio readiness.
  * - run(): execute this class's thread loop in the order shown in its flowchart.
  * - processCommand(): validate a decoded GUI command and dispatch its named system operation.
@@ -49,6 +49,21 @@
  * - fail_start_playback(): undo partial playback preparation and report the failure.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Linux pthread CPU affinity:
+// https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// libudev contexts, device properties, enumeration and hotplug monitoring:
+// https://www.freedesktop.org/software/systemd/man/latest/libudev.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include "phonostethos/SystemController.h" // Include the SystemController class/types used here; implements th_Main: validation, worker coordination, authoritative state and LED masks.
 
 #include "phonostethos/protocol.h" // Include the protocol class/types used here; defines and validates the client/server binary protocol.
@@ -69,11 +84,10 @@
 using namespace std; // Allow the names in this namespace without repeating its prefix.
 
 namespace phono_app { // Keep these declarations in the project namespace and avoid global name collisions.
-// sort() needs a comparison function. This keeps the callback explicit and named.
-static bool compare_file_names(const phono::protocol::FileEntry& first, // Pass this next argument/value to the call or initializer above.
-                               const phono::protocol::FileEntry& second) { // Declare second for this operation.
-    return first.basename < second.basename; // Return first.basename < second.basename to the caller.
-} // End this block, declaration or argument list.
+static bool compare_file_names(const phono::protocol::FileEntry& first,
+                               const phono::protocol::FileEntry& second); // Defined with the helpers below.
+
+// ==================== OBJECT SETUP ====================
 
 // WIRING: pass the SAME queue/buffer objects by reference to all their users.
 // writer_ owns its FileIO mailbox; audio_ owns its AudioDSP mailbox;
@@ -94,6 +108,8 @@ SystemController::~SystemController() { // Stop/join all workers before releasin
     stop(); // Request teardown and join workers before destroying their shared resources.
     pthread_mutex_destroy(&configuration_mutex_); // Release this initialized mutex after its users have stopped.
 } // End this function or local scope.
+
+// ==================== MAIN METHODS - REPORT ORDER ====================
 
 // Prepare shared resources first; only then create the three worker pthreads.
 // FLOWCHART: Boot -> prepare devices/buffers/FFTW -> start worker threads.
@@ -566,6 +582,7 @@ void SystemController::ejectStorage() { // Synchronize and unmount storage in Fi
 
 bool SystemController::initUdevMonitor() { // Subscribe to Linux block-device events and obtain the monitor descriptor.
     /* API: udev_new
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Create the userspace udev context. NULL means creation failed. Release the context with udev_unref after the monitor is no longer used.
      */
     udev_context_ = udev_new(); // Set udev context to udev_new().
@@ -574,28 +591,33 @@ bool SystemController::initUdevMonitor() { // Subscribe to Linux block-device ev
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: udev_monitor_new_from_netlink
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Subscribe to udev device notifications using the existing context. Add a subsystem filter and enable receiving before polling its descriptor.
      */
     udev_monitor_ = udev_monitor_new_from_netlink(udev_context_, "udev"); // Set udev monitor to udev_monitor_new_from_netlink(udev_context_, "udev").
     if (udev_monitor_ == nullptr || // Test the condition udev_monitor_ == nullptr ||.
         /* API: udev_monitor_filter_add_match_subsystem_devtype
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Filter monitor events to the required subsystem/device type before receiving. A negative return indicates failure.
          */
         udev_monitor_filter_add_match_subsystem_devtype( // Call udev_monitor_filter_add_match_subsystem_devtype with the arguments shown here.
             udev_monitor_, "block", nullptr) < 0 || // Continue this calculation/condition with the next line.
         /* API: udev_monitor_enable_receiving
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Enable delivery to the configured monitor. Check the return before asking for its descriptor.
          */
         udev_monitor_enable_receiving(udev_monitor_) < 0) { // Call udev_monitor_enable_receiving with the arguments shown here.
         cerr << "Cannot initialize udev block-device monitor\n"; // Print the diagnostic or test result for the operator.
         if (udev_monitor_ != nullptr) { // Test the condition udev_monitor_ != nullptr.
             /* API: udev_monitor_unref
+             * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
              * Release the monitor during teardown, after Main has stopped checking its descriptor.
              */
             udev_monitor_unref(udev_monitor_); // Call udev_monitor_unref with the arguments shown here.
             udev_monitor_ = nullptr; // Set udev monitor to nullptr.
         } // End this block, declaration or argument list.
         /* API: udev_unref
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Release the libudev context after its monitor is released.
          */
         udev_unref(udev_context_); // Call udev_unref with the arguments shown here.
@@ -603,6 +625,7 @@ bool SystemController::initUdevMonitor() { // Subscribe to Linux block-device ev
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: udev_monitor_get_fd
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Get the monitor's file descriptor for poll(). Poll with zero timeout in Main so USB checking does not block command dispatch.
      */
     udev_fd_ = udev_monitor_get_fd(udev_monitor_); // Set udev fd to udev_monitor_get_fd(udev_monitor_).
@@ -624,6 +647,7 @@ void SystemController::checkUsbEvents() { // Poll udev without blocking and reta
     } // End this block, declaration or argument list.
     pollfd event{udev_fd_, POLLIN, 0}; // Declare event for this operation.
     /* API: ::poll
+     * Documentation: https://man7.org/linux/man-pages/man2/poll.2.html
      * Wait for descriptor readiness for a bounded number of milliseconds. Positive means events, zero means timeout, -1 means error.
      */
     const int ready = ::poll(&event, 1, 0); // Initialize ready to ::poll(&event, 1, 0).
@@ -640,6 +664,7 @@ void SystemController::checkUsbEvents() { // Poll udev without blocking and reta
     while (true) { // Repeat this block while its condition remains true; recheck shared state on each pass.
         errno = 0; // Set errno to 0.
         /* API: udev_monitor_receive_device
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Read one available device event from the udev monitor. Inspect its action, devnode and properties, then release it with udev_device_unref.
          */
         udev_device* device = udev_monitor_receive_device(udev_monitor_); // Initialize device to udev_monitor_receive_device(udev_monitor_).
@@ -652,20 +677,24 @@ void SystemController::checkUsbEvents() { // Poll udev without blocking and reta
         } // End this block, declaration or argument list.
         const auto* usb_parent = // Start initializing this local value from the expression on the next line.
             /* API: udev_device_get_parent_with_subsystem_devtype
+             * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
              * Find a matching parent device, used here to distinguish USB storage. The returned parent is borrowed; the current device owns the reference relationship.
              */
             udev_device_get_parent_with_subsystem_devtype( // Call udev_device_get_parent_with_subsystem_devtype with the arguments shown here.
                 device, "usb", "usb_device"); // Complete the call above with these remaining arguments.
         /* API: udev_device_get_action
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Read the event action string such as add/remove/change. The borrowed string may be nullptr and remains tied to this udev device.
          */
         const char* action = udev_device_get_action(device); // Initialize action to udev_device_get_action(device).
         /* API: udev_device_get_devnode
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Read the block-device path, for example /dev/sda1. Check nullptr before building the FileIO request.
          */
         const char* device_node = udev_device_get_devnode(device); // Initialize device node to udev_device_get_devnode(device).
         const char* filesystem_type = // Start initializing this local value from the expression on the next line.
             /* API: udev_device_get_property_value
+             * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
              * Read a named property such as ID_FS_TYPE. The returned string is borrowed; copy it into the mailbox request before unref.
              */
             udev_device_get_property_value(device, "ID_FS_TYPE"); // Call udev_device_get_property_value with the arguments shown here.
@@ -690,6 +719,7 @@ void SystemController::checkUsbEvents() { // Poll udev without blocking and reta
             } // End this block, declaration or argument list.
         } // End this block, declaration or argument list.
         /* API: udev_device_unref
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Release the event-device reference after copying the required fields. Do not keep borrowed strings after this point.
          */
         udev_device_unref(device); // Call udev_device_unref with the arguments shown here.
@@ -749,6 +779,8 @@ void SystemController::stop() { // Request teardown and join workers before dest
     led_driver_.closeDriver(); // Call led_driver_.closeDriver with the arguments shown here.
     command_queue_.close(); // Call command_queue_.close with the arguments shown here.
 } // End this function or local scope.
+
+// ==================== PRIVATE HELPERS ====================
 
 uint32_t SystemController::begin_operation( // Begin this function/widget call; its arguments follow below.
     OperationKind kind, phono::protocol::CommandType command, uint32_t argument) { // Declare kind for this operation.
@@ -965,14 +997,17 @@ void SystemController::set_main_thread_policy() { // Request CPU 0 affinity and 
     // Main and Network are peers: SCHED_OTHER priority 0, nice 0.
     sched_param normal_priority{}; // Declare normal priority for this operation.
     /* API: pthread_setschedparam
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Request the scheduling policy and sched_priority stored in sched_param. FIFO 80 is AudioDSP and FIFO 50 is FileIO. SCHED_OTHER requires priority 0.
      */
     /* API: pthread_self
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Return the calling pthread handle, used when setting this worker's affinity or scheduling policy.
      */
     const int policy_error = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority); // Initialize policy error to pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority).
     if (policy_error != 0) cerr << "Cannot set normal scheduling: " << strerror(policy_error) << '\n'; // Test the condition policy_error != 0. If true, print the diagnostic or test result for the operator.
     /* API: setpriority
+     * Documentation: https://man7.org/linux/man-pages/man2/setpriority.2.html
      * Set the calling Linux thread's nice value with PRIO_PROCESS and ID 0. Nice 0 is normal SCHED_OTHER weight; it is distinct from FIFO priority 50/80. Returns 0 or -1 with errno.
      */
     if (setpriority(PRIO_PROCESS, 0, 0) != 0) cerr << "Cannot set nice 0: " << strerror(errno) << '\n'; // Test the condition setpriority(PRIO_PROCESS, 0, 0) != 0. If true, print the diagnostic or test result for the operator.
@@ -982,6 +1017,7 @@ void SystemController::set_main_thread_policy() { // Request CPU 0 affinity and 
     CPU_SET(0, &cpus); // Call CPU_SET with the arguments shown here.
     const int result = // Start initializing this local value from the expression on the next line.
         /* API: pthread_setaffinity_np
+         * Documentation: https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
          * Ask Linux to run this pthread on the CPUs in cpu_set_t. pthread_self identifies the current worker. Check the returned error number.
          */
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Call pthread_setaffinity_np with the arguments shown here.
@@ -1555,6 +1591,12 @@ void SystemController::fail_start_playback(uint8_t error_code) { // Undo partial
         complete_operation(false, pending_.error_code); // Publish the final command result and clear Main's pending context.
     } // End this block, declaration or argument list.
 } // End this function or local scope.
+
+// sort() needs a comparison function. This keeps the callback explicit and named.
+static bool compare_file_names(const phono::protocol::FileEntry& first, // Pass this next argument/value to the call or initializer above.
+                               const phono::protocol::FileEntry& second) { // Declare second for this operation.
+    return first.basename < second.basename; // Return first.basename < second.basename to the caller.
+} // End this block, declaration or argument list.
 
 
 }  // namespace phono_app

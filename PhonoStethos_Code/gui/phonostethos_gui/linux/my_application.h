@@ -7,6 +7,17 @@
  * - my_application_new(): provide the GTK/Flutter runner callback my_application_new.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// GTK 3 application/window APIs used by the Linux desktop runner:
+// https://docs.gtk.org/gtk3/
+// GObject type registration, ownership and lifecycle:
+// https://docs.gtk.org/gobject/
+// GApplication registration, activation and process lifecycle:
+// https://docs.gtk.org/gio/class.Application.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #ifndef FLUTTER_MY_APPLICATION_H_ // Compile this section only when the preprocessor condition holds.
 #define FLUTTER_MY_APPLICATION_H_ // Define FLUTTER_MY_APPLICATION_H_ for the preprocessor.
 

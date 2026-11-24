@@ -19,6 +19,17 @@
  * - spectrumDbfs(): convert linear peak amplitude to dBFS with a -120 dBFS display floor.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// Dart ByteData: explicit-width integers/floats and byte order:
+// https://api.dart.dev/dart-typed_data/ByteData-class.html
+// Dart UTF-8 encoding/decoding:
+// https://api.dart.dev/dart-convert/Utf8Codec-class.html
+// Dart math: sqrt/log and numeric calculations:
+// https://api.dart.dev/dart-math/dart-math-library.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 import 'dart:convert'; // Import strict UTF-8 decoding of archive names.
 import 'dart:math' as math; // Import square-root/logarithm functions used to display spectrum amplitudes.
 import 'dart:typed_data'; // Import byte arrays and explicit big-endian integer/float access.

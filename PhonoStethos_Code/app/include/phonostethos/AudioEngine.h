@@ -27,6 +27,19 @@
  * - threadEntry(): recover the object pointer passed to pthread_create and call its worker loop.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// ALSA PCM: stream setup, capture, output and recovery:
+// https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/CircularBuffer.h" // PCM16 ring buffer used for recording and playback audio streams
@@ -80,14 +93,7 @@ public: // The class operations callable by other code.
     bool request(Request request); // Put one control record into the worker mailbox if its slot is free.
 
 private: // Internal helpers and state used by this class.
-    // Named processing steps correspond to the AudioDSP flowchart boxes.
-    void apply_output_gain(float* filtered, int16_t* output, // Pass this next argument/value to the call or initializer above.
-                           snd_pcm_sframes_t count, unsigned gain_code, // Declare count for this operation.
-                           float& applied_gain); // Declare applied gain for this operation.
-    void write_output_block(const int16_t* output, snd_pcm_sframes_t count); // Send processed samples to the headphones and report unrecoverable output failure.
-    static int configure_pcm(snd_pcm_t* pcm); // Applies hardware/software PCM parameters and prepares the stream
-    static bool recover_pcm(snd_pcm_t* pcm, snd_pcm_sframes_t error); // Recovers PCM stream from xrun/suspend errors
-    void set_audio_thread_policy(); // Pins worker to CPU 1 and attempts SCHED_FIFO real-time priority 80
+    // Worker loop follows the thread flowchart.
     void run(); // Main real-time audio processing loop executed by the worker thread
 
     const Options& options_; // PCM device names and runtime options
@@ -98,14 +104,11 @@ private: // Internal helpers and state used by this class.
     // QUEUE REFERENCES: these refer to the same objects owned by SystemController.
     // A reference (&) shares an existing object; it does not create another queue.
     // RESULT QUEUE: build a MainMessage and send it through the reference below.
-    void post_result(WorkerResultCode code, uint32_t operation_id, uint8_t error = 0); // Construct a MainMessage and enqueue completion or error through CommandQueue.
     CommandQueue& messages_; // AudioDSP enqueues results/errors; Main dequeues them.
     // VISUALIZATION QUEUE: FFT publishing uses this single latest-snapshot channel.
-    void publish_visualization(const int16_t* output, snd_pcm_sframes_t count); // Compute a new FFT and offer its waveform/spectrum to DataQueue without waiting.
     DataQueue& telemetry_;   // AudioDSP publishes waveform/FFT; Network takes it.
     pthread_mutex_t& configuration_mutex_; // Protect the mode/gain pair while Main publishes and AudioDSP copies it.
     // AUDIO BUFFERS: these references point to the two Main-owned sample buffers.
-    void store_recording_block(const int16_t* output, snd_pcm_sframes_t count); // Push processed samples into the recording buffer and report an overrun.
     CircularBuffer& recording_buffer_; // AudioDSP pushes; FileIO pops recording samples.
     CircularBuffer& playback_buffer_; // Ring buffer fed by FileIoManager playback
     atomic<uint32_t>& dropped_telemetry_; // Count visualization updates skipped when the channel is busy or disconnected.
@@ -120,8 +123,6 @@ private: // Internal helpers and state used by this class.
     // DO:   apply_request() executes that local copy outside the mailbox lock.
     // AudioDSP checks this slot at a block boundary or on its idle-loop pass;
     // this mailbox has no separate condition variable or waiting request queue.
-    bool take_request(Request& request); // Called by run(): true means a record was taken.
-    bool apply_request(Request request, bool& playback_active); // Execute the taken record.
     pthread_mutex_t request_mutex_{}; // Protect the AudioDSP request struct together with its occupied flag.
     Request request_{};              // The one shared control-message slot.
     bool has_request_ = false;       // true = unprocessed request; false = free.
@@ -130,8 +131,22 @@ private: // Internal helpers and state used by this class.
     snd_pcm_t* playback_handle_ = nullptr; // ALSA playback PCM handle owned by the worker thread
     atomic<snd_pcm_t*> capture_pcm_{nullptr}; // Atomic pointer allowing stop() to call snd_pcm_drop safely
     pthread_mutex_t capture_mutex_{}; // Synchronizes stop() with resumeCapture()/shutdown on capture PCM
-    static void* threadEntry(void* context); // Static pthread start routine forwarding to AudioEngine::run()
     pthread_t worker_{}; // POSIX pthread handle created by start and later passed to pthread_join.
     bool worker_started_ = false; // Track whether a pthread was actually created and must be joined.
+    // ==================== PRIVATE HELPER METHODS ====================
+    void apply_output_gain(float* filtered, int16_t* output, // Pass this next argument/value to the call or initializer above.
+                           snd_pcm_sframes_t count, unsigned gain_code, // Declare count for this operation.
+                           float& applied_gain); // Declare applied gain for this operation.
+    void write_output_block(const int16_t* output, snd_pcm_sframes_t count); // Send processed samples to the headphones and report unrecoverable output failure.
+    static int configure_pcm(snd_pcm_t* pcm); // Applies hardware/software PCM parameters and prepares the stream
+    static bool recover_pcm(snd_pcm_t* pcm, snd_pcm_sframes_t error); // Recovers PCM stream from xrun/suspend errors
+    void set_audio_thread_policy(); // Pins worker to CPU 1 and attempts SCHED_FIFO real-time priority 80
+    void post_result(WorkerResultCode code, uint32_t operation_id, uint8_t error = 0); // Construct a MainMessage and enqueue completion or error through CommandQueue.
+    void publish_visualization(const int16_t* output, snd_pcm_sframes_t count); // Compute a new FFT and offer its waveform/spectrum to DataQueue without waiting.
+    void store_recording_block(const int16_t* output, snd_pcm_sframes_t count); // Push processed samples into the recording buffer and report an overrun.
+    bool take_request(Request& request); // Called by run(): true means a record was taken.
+    bool apply_request(Request request, bool& playback_active); // Execute the taken record.
+    static void* threadEntry(void* context); // Static pthread start routine forwarding to AudioEngine::run()
+
 }; // End this block, declaration or argument list.
 }  // namespace phono_app // Close phono_app namespace

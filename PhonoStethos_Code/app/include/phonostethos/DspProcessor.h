@@ -14,6 +14,13 @@
  * - filter_limits(): select GENERAL, HEART or LUNG high-pass and low-pass cutoff frequencies.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// FFTW: real-to-complex planning/execution and single-precision fftwf APIs:
+// https://www.fftw.org/fftw3_doc/
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/BandPassFilter.h" // Include the BandPassFilter class/types used here; implements the floating-point high-pass/low-pass biquad cascade.
@@ -46,7 +53,6 @@ public: // The class operations callable by other code.
     const array<float, kFftFrames>& waveform() const { return waveform_; } // Return the matching normalized waveform without making another array copy.
 
 private: // Internal helpers and state used by this class.
-    static void filter_limits(unsigned mode, double& low, double& high); // Select GENERAL, HEART or LUNG high-pass and low-pass cutoff frequencies.
 
     array<float, kFftFrames> history_{}; // Normalized processed samples in the rolling FFT history.
     size_t history_next_ = 0; // Next history write position; when full, it is also the oldest retained sample.
@@ -59,5 +65,8 @@ private: // Internal helpers and state used by this class.
     unsigned configured_mode_ = 99; // 99 means no profile is configured yet; the first block forces coefficient setup.
     size_t frames_since_fft_ = 0; // Count new samples toward the next 512-sample FFT hop.
     bool fft_ready_ = false; // True only when this computeFFT call produced a complete new spectrum.
+    // ==================== PRIVATE HELPER METHODS ====================
+    static void filter_limits(unsigned mode, double& low, double& high); // Select GENERAL, HEART or LUNG high-pass and low-pass cutoff frequencies.
+
 }; // End this block, declaration or argument list.
 }  // namespace phono_app

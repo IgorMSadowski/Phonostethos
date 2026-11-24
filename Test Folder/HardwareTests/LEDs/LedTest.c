@@ -8,6 +8,13 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Test the character-device mask interface and inspect the actual LEDs by eye.
 #include <fcntl.h> // Include descriptor open flags such as O_CLOEXEC and exclusive creation.
@@ -35,6 +42,7 @@ int main(int argc, char** argv) { // Run this standalone test and return success
         return 1; // Return 1 to the caller.
     } // End this block, declaration or argument list.
     /* API: signal
+     * Documentation: https://man7.org/linux/man-pages/man2/signal.2.html
      * Register the SIGINT/SIGTERM service-stop callback. The callback only requests stop; ordinary code performs worker/resource teardown.
      */
     signal(SIGINT, stop_test); // Call signal with the arguments shown here.
@@ -47,6 +55,7 @@ int main(int argc, char** argv) { // Run this standalone test and return success
         printf("Mask 0x%02x: expect %s\n", masks[i], expected[i]); // Print the diagnostic or test result for the operator.
         fflush(stdout); // Call fflush with the arguments shown here.
         /* API: write(fd, &mask, 1)
+         * Documentation: https://man7.org/linux/man-pages/man2/write.2.html
          * Send one BINARY mask byte. This is not the text "01" or "1".
          * Each write replaces the complete state of all four LEDs.
          */
@@ -57,6 +66,7 @@ int main(int argc, char** argv) { // Run this standalone test and return success
         } // End this block, declaration or argument list.
         struct timespec pause = {1, 0}; // Group the related fields in one plain data record.
         /* API: nanosleep
+         * Documentation: https://man7.org/linux/man-pages/man2/nanosleep.2.html
          * Sleep for the relative timespec interval instead of spinning while idle. A signal may interrupt the sleep before the whole interval has elapsed.
          */
         while (nanosleep(&pause, &pause) != 0 && !interrupted) {} // Repeat this block while its condition remains true; recheck shared state on each pass.

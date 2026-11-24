@@ -47,6 +47,19 @@
  * - dispatch_deferred_mount(): retry Main's retained storage-device request when FileIO can accept it.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// libudev contexts, device properties, enumeration and hotplug monitoring:
+// https://www.freedesktop.org/software/systemd/man/latest/libudev.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/AudioEngine.h" // Include the AudioEngine class/types used here; implements th_AudioDSP: live capture, filtered/gained output, stored playback and FFT publication.
@@ -129,29 +142,6 @@ private: // Internal helpers and state used by this class.
         WorkflowStage stage = WorkflowStage::WaitingForWorkers; // Initialize stage to WorkflowStage::WaitingForWorkers.
     }; // End this block, declaration or argument list.
 
-    uint32_t begin_operation(OperationKind kind, // Pass this next argument/value to the call or initializer above.
-                            phono::protocol::CommandType command, // Declare command for this operation.
-                            uint32_t argument); // Declare argument for this operation.
-    void processMessage(const MainMessage& message); // Route MainMessage by kind to command handling or worker-result handling.
-    bool handle_notification(const MainMessage& message); // Handle unsolicited worker/connection events outside an active GUI transition.
-    void handle_operation_error(const MainMessage& message); // Fail the matching transition and coordinate any required cleanup.
-    void handle_recording_result(const MainMessage& message); // Advance recording open/close only after the matching FileIO result.
-    void handle_playback_result(const MainMessage& message); // Advance playback preparation/stop through worker acknowledgements.
-    void complete_operation(bool success, uint8_t error_code = 0); // Publish the final command result and clear Main's pending context.
-    void publish_status(); // Derive the storage/button capability packet from current authoritative state.
-    void publish_state(); // Serialize transport, mode, gain, storage, session and diagnostic counters.
-    void publish_command_result(phono::protocol::CommandType command, // Pass this next argument/value to the call or initializer above.
-                                phono::protocol::Result result, // Declare result for this operation.
-                                uint32_t detail); // Declare detail for this operation.
-    void update_leds(); // Build and write the complete mode-plus-recording mask from Main's acknowledged state.
-    void handle_archive_result(const MainMessage& message); // Update the stable connection-scoped file-ID registry from FileIO's scan.
-    void start_playback_cleanup(uint32_t operation_id, // Pass this next argument/value to the call or initializer above.
-                               bool report_result, // Declare report result for this operation.
-                               uint8_t error_code = 0); // Initialize error code to 0).
-    void fail_start_playback(uint8_t error_code); // Undo partial playback preparation and report the failure.
-    void queue_archive_page(uint32_t cursor); // Prepare a bounded page of IDs and names for the GUI archive.
-    void set_error(uint8_t error_code); // Publish the current system error code atomically.
-    void set_main_thread_policy(); // Request CPU 0 affinity and SCHED_OTHER priority 0 with nice 0.
 
     const Options& options_; // Declare options for this class instance.
     atomic<unsigned> mode_{static_cast<unsigned>(FilterMode::GENERAL)}; // Selected filter code; Main writes it and AudioDSP reads a configuration snapshot.
@@ -209,11 +199,6 @@ private: // Internal helpers and state used by this class.
     udev_monitor* udev_monitor_ = nullptr; // Initialize udev monitor to nullptr.
     int udev_fd_ = -1; // Monitor descriptor, or -1 when the monitor is unavailable/closed.
     // MAILBOX DELIVERY: all send/retry helpers are implemented together in the .cpp.
-    bool request_file(FileIoManager::Request request); // Submit to FileIO's one slot.
-    bool queue_file_request(FileIoManager::Request request); // Submit or retain for retry.
-    bool request_audio(AudioEngine::Request request); // Submit to AudioDSP's one slot.
-    void dispatch_deferred_operation_request(); // Retry Main's retained storage operation.
-    void dispatch_deferred_mount(); // Retry Main's retained mount/device request.
     // MAIN'S RETRY RECORDS: retain a FileIO request if its mailbox is occupied.
     // Only Main uses these local slots. dispatch_deferred_* retries delivery;
     // the shared FileIO mailbox itself is writer_.mailbox_ in FileIoManager.h.
@@ -221,5 +206,35 @@ private: // Internal helpers and state used by this class.
     bool has_deferred_operation_ = false; // Mark deferred operation as empty.
     FileIoManager::Request deferred_storage_request_{}; // Main-only retry record for a udev mount/removal/capability request.
     bool has_deferred_storage_ = false; // Mark deferred storage as empty.
+    // ==================== PRIVATE HELPER METHODS ====================
+    uint32_t begin_operation(OperationKind kind, // Pass this next argument/value to the call or initializer above.
+                            phono::protocol::CommandType command, // Declare command for this operation.
+                            uint32_t argument); // Declare argument for this operation.
+    void processMessage(const MainMessage& message); // Route MainMessage by kind to command handling or worker-result handling.
+    bool handle_notification(const MainMessage& message); // Handle unsolicited worker/connection events outside an active GUI transition.
+    void handle_operation_error(const MainMessage& message); // Fail the matching transition and coordinate any required cleanup.
+    void handle_recording_result(const MainMessage& message); // Advance recording open/close only after the matching FileIO result.
+    void handle_playback_result(const MainMessage& message); // Advance playback preparation/stop through worker acknowledgements.
+    void complete_operation(bool success, uint8_t error_code = 0); // Publish the final command result and clear Main's pending context.
+    void publish_status(); // Derive the storage/button capability packet from current authoritative state.
+    void publish_state(); // Serialize transport, mode, gain, storage, session and diagnostic counters.
+    void publish_command_result(phono::protocol::CommandType command, // Pass this next argument/value to the call or initializer above.
+                                phono::protocol::Result result, // Declare result for this operation.
+                                uint32_t detail); // Declare detail for this operation.
+    void update_leds(); // Build and write the complete mode-plus-recording mask from Main's acknowledged state.
+    void handle_archive_result(const MainMessage& message); // Update the stable connection-scoped file-ID registry from FileIO's scan.
+    void start_playback_cleanup(uint32_t operation_id, // Pass this next argument/value to the call or initializer above.
+                               bool report_result, // Declare report result for this operation.
+                               uint8_t error_code = 0); // Initialize error code to 0).
+    void fail_start_playback(uint8_t error_code); // Undo partial playback preparation and report the failure.
+    void queue_archive_page(uint32_t cursor); // Prepare a bounded page of IDs and names for the GUI archive.
+    void set_error(uint8_t error_code); // Publish the current system error code atomically.
+    void set_main_thread_policy(); // Request CPU 0 affinity and SCHED_OTHER priority 0 with nice 0.
+    bool request_file(FileIoManager::Request request); // Submit to FileIO's one slot.
+    bool queue_file_request(FileIoManager::Request request); // Submit or retain for retry.
+    bool request_audio(AudioEngine::Request request); // Submit to AudioDSP's one slot.
+    void dispatch_deferred_operation_request(); // Retry Main's retained storage operation.
+    void dispatch_deferred_mount(); // Retry Main's retained mount/device request.
+
 }; // End this block, declaration or argument list.
 }  // namespace phono_app

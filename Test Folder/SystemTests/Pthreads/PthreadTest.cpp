@@ -8,6 +8,13 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 // Exercise the actual project's CircularBuffer, CommandQueue and DataQueue.
 #include "phonostethos/CircularBuffer.h" // Include the CircularBuffer class/types used here; implements the shared PCM16 circular sample buffer.
 #include "phonostethos/CommandQueue.h" // Include the CommandQueue class/types used here; defines MainMessage and the FIFO consumed by th_Main.
@@ -35,6 +42,7 @@ static void* produce(void* context) { // Finish the parameters/condition and ent
             if (transfer->failed.load()) return nullptr; // Test the condition transfer->failed.load(). If true, return nullptr to the caller.
             const timespec pause{0, 1000000}; // Declare pause for this operation.
             /* API: nanosleep
+             * Documentation: https://man7.org/linux/man-pages/man2/nanosleep.2.html
              * Sleep for the relative timespec interval instead of spinning while idle. A signal may interrupt the sleep before the whole interval has elapsed.
              */
             nanosleep(&pause, nullptr); // Let the consumer free buffer space.
@@ -54,6 +62,7 @@ int main() { // Run this standalone test and return success only if its checks p
     if (!transfer.buffer.begin_session()) return 1; // Test the condition !transfer.buffer.begin_session(). If true, return 1 to the caller.
     pthread_t worker; // Declare worker for this operation.
     /* API: pthread_create
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Start produce() on a second thread and pass it the address of shared data.
      * The buffer's own pthread mutex/condition protect its push/pop operations.
      */

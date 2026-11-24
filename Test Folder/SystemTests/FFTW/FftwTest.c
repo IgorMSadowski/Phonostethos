@@ -7,6 +7,13 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// FFTW: real-to-complex planning/execution and single-precision fftwf APIs:
+// https://www.fftw.org/fftw3_doc/
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Test the FFTW3f library directly, independently of the microphone and GUI.
 // API reference: https://www.fftw.org/fftw3_doc/One_002dDimensional-DFTs-of-Real-Data.html
@@ -25,6 +32,7 @@ int main(void) { // Run this standalone test and return success only if its chec
         input[i] = sin(2.0 * pi * 1000.0 * i / rate); // Set input[i] to sin(2.0 * pi * 1000.0 * i / rate).
     } // End this block, declaration or argument list.
     /* API: fftwf_plan_dft_r2c_1d
+     * Documentation: https://www.fftw.org/fftw3_doc/
      * Prepare a real-to-complex single-precision transform. FFTW_ESTIMATE avoids
      * expensive planning. Planning is done once, before processing samples.
      */

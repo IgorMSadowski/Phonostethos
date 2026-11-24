@@ -10,6 +10,8 @@
  * - writeByte(): send one complete four-bit LED mask and check the returned byte count.
  */
 
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include <cstdint> // Include integer types with exact bit widths used by PCM and the binary protocol.

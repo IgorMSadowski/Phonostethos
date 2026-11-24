@@ -41,6 +41,27 @@
  * - Padding(): Padding.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// Dart TCP client Socket: connect, received-byte stream and outgoing sink:
+// https://api.dart.dev/dart-io/Socket-class.html
+// Dart futures, streams, subscriptions and timers:
+// https://api.dart.dev/dart-async/dart-async-library.html
+// Dart math: sqrt/log and numeric calculations:
+// https://api.dart.dev/dart-math/dart-math-library.html
+// Flutter Material controls and widget APIs:
+// https://api.flutter.dev/flutter/material/material-library.html
+// fl_chart 0.71.0: the chart package version in pubspec.lock:
+// https://pub.dev/documentation/fl_chart/0.71.0/fl_chart/
+// Flutter State.setState: synchronous state update and scheduled rebuild:
+// https://api.flutter.dev/flutter/widgets/State/setState.html
+// Flutter showDialog: await the user confirmation result:
+// https://api.flutter.dev/flutter/material/showDialog.html
+// Dart IOSink.flush: asynchronous local submission, not a server acknowledgement:
+// https://api.dart.dev/dart-io/IOSink/flush.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 import 'dart:math' show sqrt; // Import square-root/logarithm functions used to display spectrum amplitudes.
 import 'dart:async'; // Import timers, stream subscriptions and asynchronous cleanup helpers.
 import 'dart:io'; // Import the Dart TCP Socket client and SocketException.

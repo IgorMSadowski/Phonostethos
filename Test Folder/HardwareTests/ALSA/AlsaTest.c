@@ -11,6 +11,17 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// ALSA PCM: stream setup, capture, output and recovery:
+// https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Standalone microphone/headphone check, based on the original DD_AlsaTest.
 // Uses libsndfile for WAV headers instead of assuming every WAV has 44 header bytes.
@@ -53,6 +64,7 @@ static bool open_pcm(snd_pcm_t** pcm, const char* name, snd_pcm_stream_t directi
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: snd_pcm_set_params
+     * Documentation: https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html
      * Configure S16_LE, interleaved access, mono, 8000 Hz and allow conversion
      * by the selected plugin. 128000 us requests the diagnostic stream latency;
      * it is not a measurement of the complete project's latency.
@@ -109,6 +121,7 @@ static int record_file(const char* path, int seconds, const char* name) { // Fin
             break; // Leave the current loop or switch branch.
         } // End this block, declaration or argument list.
         /* API: sf_write_short
+         * Documentation: https://libsndfile.github.io/libsndfile/api.html
          * Write the requested PCM16 sample count from the supplied array. Returns the actual count; compare it with the requested count to detect a short write.
          */
         if (count == 0 || sf_write_short(file, samples, count) != count) { // Test the condition count == 0 || sf_write_short(file, samples, count) != count.
@@ -124,18 +137,22 @@ static int record_file(const char* path, int seconds, const char* name) { // Fin
         done += count; // Update done using += count.
     } // End this block, declaration or argument list.
     /* API: sf_write_sync
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Ask libsndfile to flush pending writes. This function returns void, so check sf_error and the subsequent checked close/synchronization results too.
      */
     sf_write_sync(file); // Call sf_write_sync with the arguments shown here.
     /* API: sf_error
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Read the libsndfile error associated with a handle. Compare with SF_ERR_NO_ERROR before claiming a write/finalization succeeded.
      */
     if (sf_error(file) != SF_ERR_NO_ERROR) success = false; // Test the condition sf_error(file) != SF_ERR_NO_ERROR. If true, set success to false.
     /* API: sf_close
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Finalize/release a libsndfile handle. A nonzero result indicates a close/finalization error. This project closes retained POSIX descriptors separately.
      */
     if (sf_close(file) != 0) success = false; // Test the condition sf_close(file) != 0. If true, set success to false.
     /* API: fsync
+     * Documentation: https://man7.org/linux/man-pages/man2/fsync.2.html
      * Synchronize this open file descriptor and report 0 or -1 with errno. FileIO checks it before reporting successful recording finalization.
      */
     if (fsync(fd) != 0) success = false; // Test the condition fsync(fd) != 0. If true, set success to false.
@@ -175,6 +192,7 @@ static int play_file(const char* path, const char* name) { // Finish the paramet
     short samples[512] = {0}; // Initialize samples to {0}.
     while (success) { // Repeat this block while its condition remains true; recheck shared state on each pass.
         /* API: sf_read_short
+         * Documentation: https://libsndfile.github.io/libsndfile/api.html
          * Read at most the requested count of PCM16 samples into the supplied array. Returns the actual count; a short read needs EOF/error classification. Mono samples equal frames.
          */
         long count = sf_read_short(file, samples, 512); // Initialize count to sf_read_short(file, samples, 512).

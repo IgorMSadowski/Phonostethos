@@ -12,6 +12,15 @@
  * - led_bytes(): led bytes.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include "phonostethos/DspProcessor.h" // Include the DspProcessor class/types used here; performs live band-pass filtering, gain/limiting and rolling FFT analysis.
 #include "phonostethos/FileIoManager.h" // Include the FileIoManager class/types used here; implements th_FileIO: WAV recording/playback, archive management and FAT32 USB storage operations.
 #include "phonostethos/LedDriver.h" // Include the LedDriver class/types used here; wraps the LED character-device descriptor in user space.
@@ -41,6 +50,7 @@ MainMessage await_result(CommandQueue& queue, WorkerResultCode result, uint32_t 
 ArchiveIdentity identity(const std::filesystem::path& path) { // Finish the parameters/condition and enter the block below.
     struct stat metadata {}; // Allocate file metadata storage for the checked stat/fstat call.
     /* API: lstat
+     * Documentation: https://man7.org/linux/man-pages/man2/lstat.2.html
      * Read path metadata without following its final symbolic link. Check the return and expected regular-file identity before file operations.
      */
     assert(lstat(path.c_str(), &metadata) == 0); // Verify this expected result; fail the test if it is not satisfied.
@@ -105,11 +115,13 @@ int main() { // Run this standalone test and return success only if its checks p
     assert(check && info.frames == 1041 && info.channels == 1 && info.samplerate == 8000); // Verify this expected result; fail the test if it is not satisfied.
     std::array<int16_t, 1041> saved{}; // Complete this expression or declaration.
     /* API: sf_read_short
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Read at most the requested count of PCM16 samples into the supplied array. Returns the actual count; a short read needs EOF/error classification. Mono samples equal frames.
      */
     assert(sf_read_short(check, saved.data(), saved.size()) == 1041); // Verify this expected result; fail the test if it is not satisfied.
     assert(saved == original); // Verify this expected result; fail the test if it is not satisfied.
     /* API: sf_close
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Finalize/release a libsndfile handle. A nonzero result indicates a close/finalization error. This project closes retained POSIX descriptors separately.
      */
     assert(sf_close(check) == 0); // Verify this expected result; fail the test if it is not satisfied.

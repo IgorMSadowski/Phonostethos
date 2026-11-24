@@ -4,8 +4,9 @@
  * CONNECTIONS: NetworkManager.h declares both classes; NetworkManager.cpp implements them. Only Network performs TCP I/O. It sends Main commands through CommandQueue and takes control replies before the latest DataQueue snapshot.
  *
  * FUNCTIONS:
- * - ~NetworkManager(): release this object's resources after its users have stopped.
+ * Main methods are listed first; private helpers are implemented at the end.
  * - NetworkManager(): connect the owned resources/references used by this class.
+ * - ~NetworkManager(): release this object's resources after its users have stopped.
  * - startListening(): create, bind and listen on the Raspberry Pi TCP server socket.
  * - receiveCommand(): retain partial TCP input until all five command bytes can be decoded.
  * - sendData(): serialize a waveform/FFT snapshot and send its complete frame.
@@ -15,17 +16,31 @@
  * - start(): create this worker pthread once and retain its handle for joining.
  * - stop(): request teardown and join workers before destroying their shared resources.
  * - connected(): read whether Network currently has a GUI client.
+ * - run(): execute this class's thread loop in the order shown in its flowchart.
  * - threadEntry(): recover the object pointer passed to pthread_create and call its worker loop.
  * - set_network_thread_policy(): request CPU 3 affinity and SCHED_OTHER priority 0 with nice 0.
  * - post_network_event(): send a connection or network error event to Main through CommandQueue.
  * - send_next_frame(): take one control reply first, otherwise take the latest visualization snapshot.
  * - send_all(): retry partial TCP sends using an offset and a cumulative deadline.
  * - serve_client(): alternate one outgoing frame with command reception for one connected GUI.
- * - run(): execute this class's thread loop in the order shown in its flowchart.
- * - enqueue(): store an item using this channel's locking and delivery policy.
- * - dequeue(): take an available item using this channel's receive policy.
- * - clear(): discard waiting channel data and reset its state under its owner's rules.
  */
+
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Linux pthread CPU affinity:
+// https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
+// Linux scheduling policies and real-time priorities:
+// https://man7.org/linux/man-pages/man7/sched.7.html
+// POSIX TCP socket API; follow the related bind/listen/accept/send/recv pages:
+// https://man7.org/linux/man-pages/man2/socket.2.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
 
 #include "phonostethos/NetworkManager.h" // Include the NetworkManager class/types used here; implements th_Network and its protected outgoing ControlReplyQueue.
 
@@ -51,6 +66,8 @@ using namespace std; // Allow the names in this namespace without repeating its 
 
 namespace phono_app { // Keep these declarations in the project namespace and avoid global name collisions.
 
+// ==================== OBJECT SETUP ====================
+
 NetworkManager::NetworkManager(const Options& options, CommandQueue& messages, // Pass this next argument/value to the call or initializer above.
                                DataQueue& telemetry) // Declare telemetry for this operation.
     : options_(options), // Supply the next constructor initializer or argument.
@@ -59,8 +76,11 @@ NetworkManager::NetworkManager(const Options& options, CommandQueue& messages, /
 
 NetworkManager::~NetworkManager() { stop(); } // Stop the worker and release owned resources during destruction.
 
+// ==================== MAIN METHODS - REPORT ORDER ====================
+
 bool NetworkManager::startListening() { // Create, bind and listen on the Raspberry Pi TCP server socket.
     /* API: ::socket
+     * Documentation: https://man7.org/linux/man-pages/man2/socket.2.html
      * Create a TCP socket. AF_INET means IPv4, SOCK_STREAM means a reliable byte stream. Returns a descriptor or -1 with errno.
      */
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0); // Set server fd to ::socket(AF_INET, SOCK_STREAM, 0).
@@ -73,6 +93,7 @@ bool NetworkManager::startListening() { // Create, bind and listen on the Raspbe
     } // End this block, declaration or argument list.
     int reuse = 1; // Initialize reuse to 1.
     /* API: setsockopt
+     * Documentation: https://man7.org/linux/man-pages/man2/setsockopt.2.html
      * Set the named socket option using a pointer and its exact byte size. Check the return; options here configure reuse and per-call send/receive timeouts.
      */
     (void)::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, // Pass this next argument/value to the call or initializer above.
@@ -81,12 +102,14 @@ bool NetworkManager::startListening() { // Create, bind and listen on the Raspbe
     address.sin_family = AF_INET; // Set address.sin family to AF_INET.
     address.sin_port = htons(options_.port); // Set address.sin port to htons(options_.port).
     /* API: inet_pton
+     * Documentation: https://man7.org/linux/man-pages/man3/inet_pton.3.html
      * Convert the textual bind address into binary IPv4 form. AF_INET success returns 1; invalid text returns 0 and a call error returns -1.
      */
     if (::inet_pton(AF_INET, options_.bind_address.c_str(), &address.sin_addr) != // Test the condition ::inet_pton(AF_INET, options_.bind_address.c_str(), &address.sin_addr) !=.
         1) { // Finish the parameters/condition and enter the block below.
         cerr << "Invalid IPv4 bind address: " << options_.bind_address << '\n'; // Print the diagnostic or test result for the operator.
         /* API: ::close
+         * Documentation: https://man7.org/linux/man-pages/man2/close.2.html
          * Release a descriptor after its owner has finished using it. Set the stored descriptor to -1 so it cannot be reused accidentally.
          */
         ::close(server_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
@@ -97,11 +120,13 @@ bool NetworkManager::startListening() { // Create, bind and listen on the Raspbe
         return false; // Report failure or no available item to the caller.
     } // End this block, declaration or argument list.
     /* API: ::bind
+     * Documentation: https://man7.org/linux/man-pages/man2/bind.2.html
      * Assign a local IP address and port to the listening socket. The IP must exist on the Pi. Returns 0 or -1 with errno.
      */
     if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&address), // Test the condition ::bind(server_fd_, reinterpret_cast<sockaddr*>(&address),.
                sizeof(address)) < 0 || // Call sizeof with the arguments shown here.
         /* API: ::listen
+         * Documentation: https://man7.org/linux/man-pages/man2/listen.2.html
          * Mark the socket as a listener. The backlog limits waiting connections. Accept creates a separate client descriptor.
          */
         ::listen(server_fd_, 1) < 0) { // Supply the next constructor initializer or argument.
@@ -120,6 +145,7 @@ bool NetworkManager::startListening() { // Create, bind and listen on the Raspbe
 // TCP has no message boundaries. Keep partial command bytes until all five arrive.
 bool NetworkManager::receiveCommand(phono::protocol::CommandPacket& command) { // Retain partial TCP input until all five command bytes can be decoded.
     /* API: ::recv
+     * Documentation: https://man7.org/linux/man-pages/man2/recv.2.html
      * Receive TCP bytes into the remaining command-buffer space. Positive is the number received, zero means peer closure, -1 requires checking errno. TCP may split a five-byte command.
      */
     const auto count = ::recv(client_fd_, command_bytes_.data() + bytes_received_, // Initialize count to ::recv(client_fd_, command_bytes_.data() + bytes_received_.
@@ -168,6 +194,7 @@ void NetworkManager::start() { // Create this worker pthread once and retain its
     } // End this block, declaration or argument list.
     stop_requested_.store(false); // Update the shared stop requested value atomically.
     /* API: pthread_create
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Start a POSIX worker. Pass its pthread_t address, attributes (NULL for defaults), entry callback and context pointer. Returns 0 or an error number.
      */
     const int result = pthread_create(&worker_, nullptr, &NetworkManager::threadEntry, this); // Initialize result to pthread_create(&worker_, nullptr, &NetworkManager::threadEntry, this).
@@ -184,6 +211,7 @@ void NetworkManager::stop() { // Request teardown and join workers before destro
     stop_requested_.store(true); // Update the shared stop requested value atomically.
     if (worker_started_) { // Test the condition worker_started_.
         /* API: pthread_join
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Wait for this worker to return before releasing the objects it uses. Pass the pthread handle and NULL when its return value is unused.
          */
         pthread_join(worker_, nullptr); // Call pthread_join with the arguments shown here.
@@ -192,6 +220,87 @@ void NetworkManager::stop() { // Request teardown and join workers before destro
 } // End this function or local scope.
 
 bool NetworkManager::connected() const { return connected_.load(); } // Read whether the Network worker currently has a GUI client.
+
+// ==================== THREAD FLOW ====================
+
+// This pthread is the sole owner of server_fd_ and client_fd_.
+// FLOWCHART: th_Network part 1 -> listen/accept -> serve_client (parts 2-3).
+void NetworkManager::run() { // Execute this class's thread loop in the order shown in its flowchart.
+    set_network_thread_policy(); // Request CPU 3 affinity and SCHED_OTHER priority 0 with nice 0.
+    if (!startListening()) { // Test the condition !startListening().
+        return; // Leave this function; any local scoped locks are released.
+    } // End this block, declaration or argument list.
+    post_network_event(WorkerResultCode::NETWORK_STARTED); // Send a connection or network error event to Main through CommandQueue.
+    cout << "PhonoStethos server listening on " << options_.bind_address << ':' // Print the diagnostic or test result for the operator.
+              << options_.port << '\n'; // Append this part of the diagnostic output.
+
+    while (!stop_requested_.load() && running.load()) { // Repeat this block while its condition remains true; recheck shared state on each pass.
+        pollfd listener{server_fd_, POLLIN, 0}; // Declare listener for this operation.
+        const auto ready = ::poll(&listener, 1, 10); // Initialize ready to ::poll(&listener, 1, 10).
+        if (ready < 0) { // Test the condition ready < 0.
+            if (errno == EINTR) continue; // Test the condition errno == EINTR. If true, skip the rest of this pass and check the next loop iteration.
+            cerr << "Listener poll: " << strerror(errno) << '\n'; // Print the diagnostic or test result for the operator.
+            break; // Leave the current loop or switch branch.
+        } // End this block, declaration or argument list.
+        if (ready == 0 || !(listener.revents & POLLIN)) continue; // Test the condition ready == 0 || !(listener.revents & POLLIN). If true, skip the rest of this pass and check the next loop iteration.
+        sockaddr_in peer{}; // Declare peer for this operation.
+        socklen_t peer_size = sizeof(peer); // Initialize peer size to sizeof(peer).
+        client_fd_ = // Continue the expression or parameter list from the preceding line.
+            /* API: ::accept
+             * Documentation: https://man7.org/linux/man-pages/man2/accept.2.html
+             * Accept a waiting GUI connection. Returns a new descriptor. Keep the listening descriptor for later reconnects.
+             */
+            ::accept(server_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_size); // Supply the next constructor initializer or argument.
+        if (client_fd_ < 0) { // Test the condition client_fd_ < 0.
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { // Test the condition errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK.
+                continue; // Skip the rest of this pass and check the next loop iteration.
+            } // End this block, declaration or argument list.
+            cerr << "accept: " << strerror(errno) << '\n'; // Print the diagnostic or test result for the operator.
+            continue; // Skip the rest of this pass and check the next loop iteration.
+        } // End this block, declaration or argument list.
+        control_replies_.clear(); // Discard the previous contents/state of this object.
+        telemetry_.clear(); // Discard the previous contents/state of this object.
+        connected_.store(true); // Update the shared connected value atomically.
+        telemetry_.set_connected(true); // Call telemetry_.set_connected with the arguments shown here.
+        post_network_event(WorkerResultCode::CLIENT_CONNECTED); // Send a connection or network error event to Main through CommandQueue.
+        serve_client(client_fd_); // Alternate one outgoing frame with command reception for one connected GUI.
+        ::close(client_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
+        client_fd_ = -1; // Set client fd to -1.
+        connected_.store(false); // Update the shared connected value atomically.
+        telemetry_.set_connected(false); // Call telemetry_.set_connected with the arguments shown here.
+        control_replies_.clear(); // Discard the previous contents/state of this object.
+        post_network_event(WorkerResultCode::CLIENT_DISCONNECTED); // Send a connection or network error event to Main through CommandQueue.
+    } // End this block, declaration or argument list.
+    ::close(server_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
+    server_fd_ = -1; // Set server fd to -1.
+} // End this function or local scope.
+
+// ==================== CONTROL REPLY QUEUE ====================
+
+void ControlReplyQueue::enqueue(vector<uint8_t> frame) { // Store an item using this channel's locking and delivery policy.
+    PthreadLock lock(mutex_); // Lock the reply FIFO against simultaneous Network reads.
+    // QUEUE SEND (Main): add this serialized reply at the BACK of the FIFO.
+    queue_.push_back(move(frame)); // Transfer this frame to the newest end; unlock on return.
+} // End this block, declaration or argument list.
+
+bool ControlReplyQueue::dequeue(vector<uint8_t>& frame) { // Take an available item using this channel's receive policy.
+    PthreadLock lock(mutex_); // Protect the empty check, front item and removal together.
+    if (queue_.empty()) { // Test the condition queue_.empty().
+        return false; // No waiting reply; Network may check DataQueue instead.
+    } // End this block, declaration or argument list.
+    // QUEUE TAKE (Network): take the oldest reply from the FRONT.
+    // dequeue returns false when empty; its mutex uses an ordinary short lock.
+    frame = move(queue_.front()); // Network now owns the oldest frame's byte vector.
+    queue_.pop_front(); // Remove that one queue entry so it cannot be sent twice.
+    return true; // Release the mutex before Network performs the TCP send.
+} // End this block, declaration or argument list.
+
+void ControlReplyQueue::clear() { // Discard waiting channel data and reset its state under its owner's rules.
+    PthreadLock lock(mutex_); // Clear atomically relative to senders/receivers.
+    queue_.clear(); // Drop waiting replies during a GUI connection change.
+} // End this block, declaration or argument list.
+
+// ==================== PRIVATE HELPERS ====================
 
 // pthread_create expects a C-style callback; recover this NetworkManager from void*.
 void* NetworkManager::threadEntry(void* context) { // Recover the object pointer passed to pthread_create and call its worker loop.
@@ -203,14 +312,17 @@ void NetworkManager::set_network_thread_policy() { // Request CPU 3 affinity and
     // Main and Network are peers: SCHED_OTHER priority 0, nice 0.
     sched_param normal_priority{}; // Declare normal priority for this operation.
     /* API: pthread_setschedparam
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Request the scheduling policy and sched_priority stored in sched_param. FIFO 80 is AudioDSP and FIFO 50 is FileIO. SCHED_OTHER requires priority 0.
      */
     /* API: pthread_self
+     * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
      * Return the calling pthread handle, used when setting this worker's affinity or scheduling policy.
      */
     const int policy_error = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority); // Initialize policy error to pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal_priority).
     if (policy_error != 0) cerr << "Cannot set normal scheduling: " << strerror(policy_error) << '\n'; // Test the condition policy_error != 0. If true, print the diagnostic or test result for the operator.
     /* API: setpriority
+     * Documentation: https://man7.org/linux/man-pages/man2/setpriority.2.html
      * Set the calling Linux thread's nice value with PRIO_PROCESS and ID 0. Nice 0 is normal SCHED_OTHER weight; it is distinct from FIFO priority 50/80. Returns 0 or -1 with errno.
      */
     if (setpriority(PRIO_PROCESS, 0, 0) != 0) cerr << "Cannot set nice 0: " << strerror(errno) << '\n'; // Test the condition setpriority(PRIO_PROCESS, 0, 0) != 0. If true, print the diagnostic or test result for the operator.
@@ -220,6 +332,7 @@ void NetworkManager::set_network_thread_policy() { // Request CPU 3 affinity and
     CPU_SET(3, &cpus); // Call CPU_SET with the arguments shown here.
     const int result = // Start initializing this local value from the expression on the next line.
         /* API: pthread_setaffinity_np
+         * Documentation: https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html
          * Ask Linux to run this pthread on the CPUs in cpu_set_t. pthread_self identifies the current worker. Check the returned error number.
          */
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus); // Call pthread_setaffinity_np with the arguments shown here.
@@ -278,6 +391,7 @@ bool NetworkManager::send_all(int socket_fd, // Pass this next argument/value to
             return false; // Report failure or no available item to the caller.
         } // End this block, declaration or argument list.
         /* API: ::send
+         * Documentation: https://man7.org/linux/man-pages/man2/send.2.html
          * Submit remaining frame bytes to TCP. A short positive result advances the offset. MSG_NOSIGNAL prevents a closed peer from raising SIGPIPE.
          */
         const auto count = ::send(socket_fd, frame.data() + bytes_sent, // Initialize count to ::send(socket_fd, frame.data() + bytes_sent.
@@ -295,6 +409,7 @@ bool NetworkManager::send_all(int socket_fd, // Pass this next argument/value to
                         .count(); // Complete the call above with these remaining arguments.
                 pollfd writable{socket_fd, POLLOUT, 0}; // Declare writable for this operation.
                 /* API: ::poll
+                 * Documentation: https://man7.org/linux/man-pages/man2/poll.2.html
                  * Wait for descriptor readiness for a bounded number of milliseconds. Positive means events, zero means timeout, -1 means error.
                  */
                 const int ready = ::poll( // Initialize ready to ::poll(.
@@ -356,80 +471,5 @@ void NetworkManager::serve_client(int socket_fd) { // Alternate one outgoing fra
         if (receiveCommand(command)) messages_.enqueue(command); // Test the condition receiveCommand(command). If true, send this record through the named protected queue; the receiver handles it later.
     } // End this block, declaration or argument list.
 } // End this function or local scope.
-
-// This pthread is the sole owner of server_fd_ and client_fd_.
-// FLOWCHART: th_Network part 1 -> listen/accept -> serve_client (parts 2-3).
-void NetworkManager::run() { // Execute this class's thread loop in the order shown in its flowchart.
-    set_network_thread_policy(); // Request CPU 3 affinity and SCHED_OTHER priority 0 with nice 0.
-    if (!startListening()) { // Test the condition !startListening().
-        return; // Leave this function; any local scoped locks are released.
-    } // End this block, declaration or argument list.
-    post_network_event(WorkerResultCode::NETWORK_STARTED); // Send a connection or network error event to Main through CommandQueue.
-    cout << "PhonoStethos server listening on " << options_.bind_address << ':' // Print the diagnostic or test result for the operator.
-              << options_.port << '\n'; // Append this part of the diagnostic output.
-
-    while (!stop_requested_.load() && running.load()) { // Repeat this block while its condition remains true; recheck shared state on each pass.
-        pollfd listener{server_fd_, POLLIN, 0}; // Declare listener for this operation.
-        const auto ready = ::poll(&listener, 1, 10); // Initialize ready to ::poll(&listener, 1, 10).
-        if (ready < 0) { // Test the condition ready < 0.
-            if (errno == EINTR) continue; // Test the condition errno == EINTR. If true, skip the rest of this pass and check the next loop iteration.
-            cerr << "Listener poll: " << strerror(errno) << '\n'; // Print the diagnostic or test result for the operator.
-            break; // Leave the current loop or switch branch.
-        } // End this block, declaration or argument list.
-        if (ready == 0 || !(listener.revents & POLLIN)) continue; // Test the condition ready == 0 || !(listener.revents & POLLIN). If true, skip the rest of this pass and check the next loop iteration.
-        sockaddr_in peer{}; // Declare peer for this operation.
-        socklen_t peer_size = sizeof(peer); // Initialize peer size to sizeof(peer).
-        client_fd_ = // Continue the expression or parameter list from the preceding line.
-            /* API: ::accept
-             * Accept a waiting GUI connection. Returns a new descriptor. Keep the listening descriptor for later reconnects.
-             */
-            ::accept(server_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_size); // Supply the next constructor initializer or argument.
-        if (client_fd_ < 0) { // Test the condition client_fd_ < 0.
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { // Test the condition errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK.
-                continue; // Skip the rest of this pass and check the next loop iteration.
-            } // End this block, declaration or argument list.
-            cerr << "accept: " << strerror(errno) << '\n'; // Print the diagnostic or test result for the operator.
-            continue; // Skip the rest of this pass and check the next loop iteration.
-        } // End this block, declaration or argument list.
-        control_replies_.clear(); // Discard the previous contents/state of this object.
-        telemetry_.clear(); // Discard the previous contents/state of this object.
-        connected_.store(true); // Update the shared connected value atomically.
-        telemetry_.set_connected(true); // Call telemetry_.set_connected with the arguments shown here.
-        post_network_event(WorkerResultCode::CLIENT_CONNECTED); // Send a connection or network error event to Main through CommandQueue.
-        serve_client(client_fd_); // Alternate one outgoing frame with command reception for one connected GUI.
-        ::close(client_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
-        client_fd_ = -1; // Set client fd to -1.
-        connected_.store(false); // Update the shared connected value atomically.
-        telemetry_.set_connected(false); // Call telemetry_.set_connected with the arguments shown here.
-        control_replies_.clear(); // Discard the previous contents/state of this object.
-        post_network_event(WorkerResultCode::CLIENT_DISCONNECTED); // Send a connection or network error event to Main through CommandQueue.
-    } // End this block, declaration or argument list.
-    ::close(server_fd_); // Release this POSIX descriptor; the owner resets its stored descriptor to -1.
-    server_fd_ = -1; // Set server fd to -1.
-} // End this function or local scope.
-
-
-void ControlReplyQueue::enqueue(vector<uint8_t> frame) { // Store an item using this channel's locking and delivery policy.
-    PthreadLock lock(mutex_); // Lock the reply FIFO against simultaneous Network reads.
-    // QUEUE SEND (Main): add this serialized reply at the BACK of the FIFO.
-    queue_.push_back(move(frame)); // Transfer this frame to the newest end; unlock on return.
-} // End this block, declaration or argument list.
-
-bool ControlReplyQueue::dequeue(vector<uint8_t>& frame) { // Take an available item using this channel's receive policy.
-    PthreadLock lock(mutex_); // Protect the empty check, front item and removal together.
-    if (queue_.empty()) { // Test the condition queue_.empty().
-        return false; // No waiting reply; Network may check DataQueue instead.
-    } // End this block, declaration or argument list.
-    // QUEUE TAKE (Network): take the oldest reply from the FRONT.
-    // dequeue returns false when empty; its mutex uses an ordinary short lock.
-    frame = move(queue_.front()); // Network now owns the oldest frame's byte vector.
-    queue_.pop_front(); // Remove that one queue entry so it cannot be sent twice.
-    return true; // Release the mutex before Network performs the TCP send.
-} // End this block, declaration or argument list.
-
-void ControlReplyQueue::clear() { // Discard waiting channel data and reset its state under its owner's rules.
-    PthreadLock lock(mutex_); // Clear atomically relative to senders/receivers.
-    queue_.clear(); // Drop waiting replies during a GUI connection change.
-} // End this block, declaration or argument list.
 
 }  // namespace phono_app

@@ -10,6 +10,8 @@
  * - runtime(): runtime.
  */
 
+
+
 #include "phonostethos/SystemController.h" // Include the SystemController class/types used here; implements th_Main: validation, worker coordination, authoritative state and LED masks.
 
 #include <csignal> // Include SIGINT/SIGTERM registration for service teardown.
@@ -23,6 +25,7 @@ atomic<bool> running{true}; // Declare running for this operation.
 
 namespace { // Keep these declarations in the project namespace and avoid global name collisions.
 /* API: signal
+ * Documentation: https://man7.org/linux/man-pages/man2/signal.2.html
  * Register the SIGINT/SIGTERM service-stop callback. The callback only requests stop; ordinary code performs worker/resource teardown.
  */
 void handle_signal(int) { phono_app::running.store(false); } // Publish the new shared void handle signal(int) { phono app::running value atomically.

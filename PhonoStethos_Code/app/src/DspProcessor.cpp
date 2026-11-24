@@ -4,6 +4,7 @@
  * CONNECTIONS: DspProcessor.h declares state and operations; DspProcessor.cpp implements them. AudioEngine calls them from th_AudioDSP. BandPassFilter.h implements the biquad cascade; RuntimeTypes.h supplies 8 kHz/512/1024 constants. FFTW planning occurs before workers start.
  *
  * FUNCTIONS:
+ * Main methods are listed first; private helpers are implemented at the end.
  * - ~DspProcessor(): release this object's resources after its users have stopped.
  * - applyBandpass(): select the report's mode profile and run the persistent biquad filter cascade.
  * - applyGainWithLimiter(): multiply floating-point samples and clamp them before conversion to PCM16.
@@ -12,6 +13,13 @@
  * - reset(): clear processing history so a new stream does not inherit old samples.
  * - filter_limits(): select GENERAL, HEART or LUNG high-pass and low-pass cutoff frequencies.
  */
+
+// API DOCUMENTATION FOR THIS FILE:
+// FFTW: real-to-complex planning/execution and single-precision fftwf APIs:
+// https://www.fftw.org/fftw3_doc/
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
 
 #include "phonostethos/DspProcessor.h" // Include the DspProcessor class/types used here; performs live band-pass filtering, gain/limiting and rolling FFT analysis.
 
@@ -22,14 +30,19 @@ using namespace std; // Allow the names in this namespace without repeating its 
 
 namespace phono_app { // Keep these declarations in the project namespace and avoid global name collisions.
 
+// ==================== OBJECT SETUP ====================
+
 DspProcessor::~DspProcessor() { // Finish the parameters/condition and enter the block below.
     if (fft_plan_ != nullptr) { // Test the condition fft_plan_ != nullptr.
         /* API: fftwf_destroy_plan
+         * Documentation: https://www.fftw.org/fftw3_doc/
          * Release the FFT plan after the audio worker has stopped using it.
          */
         fftwf_destroy_plan(fft_plan_); // Call fftwf_destroy_plan with the arguments shown here.
     } // End this block, declaration or argument list.
 } // End this function or local scope.
+
+// ==================== MAIN METHODS - REPORT ORDER ====================
 
 // The existing tested filter has a high-pass stage followed by a low-pass stage.
 void DspProcessor::applyBandpass(const float* input, float* output, // Pass this next argument/value to the call or initializer above.
@@ -83,6 +96,7 @@ void DspProcessor::computeFFT(const int16_t* samples, float* magnitudes, int cou
         window_sum += window; // Update window sum using += window.
     } // End this block, declaration or argument list.
     /* API: fftwf_execute
+     * Documentation: https://www.fftw.org/fftw3_doc/
      * Run the previously prepared FFT plan using the arrays supplied during planning. Window and fill input before calling it.
      */
     fftwf_execute(fft_plan_); // Call fftwf_execute with the arguments shown here.
@@ -104,6 +118,7 @@ bool DspProcessor::initialize() { // Prepare resources before the audio worker s
         return true; // Report success, readiness or an available result to the caller.
     } // End this block, declaration or argument list.
     /* API: fftwf_plan_dft_r2c_1d
+     * Documentation: https://www.fftw.org/fftw3_doc/
      * Create a single-precision real-to-complex FFT plan using a length, input array, output array and planning flags. A 1024-point transform needs 513 complex outputs. Plan before starting workers.
      */
     fft_plan_ = fftwf_plan_dft_r2c_1d( // Set fft plan to fftwf_plan_dft_r2c_1d(.
@@ -121,6 +136,8 @@ void DspProcessor::reset() { // Clear processing history so a new stream does no
     frames_since_fft_ = 0; // Set frames since fft to 0.
     fft_ready_ = false; // Set fft ready to false.
 } // End this function or local scope.
+
+// ==================== PRIVATE HELPERS ====================
 
 // These are the three report profiles. Each edge is fourth-order Butterworth.
 void DspProcessor::filter_limits(unsigned mode, double& low, double& high) { // Select GENERAL, HEART or LUNG high-pass and low-pass cutoff frequencies.

@@ -17,6 +17,17 @@
  * - led_exit(): unregister the device, turn off LEDs and release the GPIO mapping.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// Linux kernel APIs; these differ from user-space C library APIs:
+// https://docs.kernel.org/core-api/kernel-api.html
+// Kernel MMIO mapping and readl/writel GPIO register access:
+// https://docs.kernel.org/driver-api/device-io.html
+// Kernel mutex locking, distinct from pthread mutexes:
+// https://docs.kernel.org/locking/mutex-design.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 // Raspberry Pi 4 LED driver, following the classroom character-device example.
 #include <linux/cdev.h>      // Character-device registration.
 #include <linux/device.h>    // Device class and /dev node.
@@ -52,10 +63,12 @@ static void set_gpio_function(unsigned int pin, unsigned int function) // Contin
     unsigned int register_index = pin / 10; // Complete this expression or declaration.
     unsigned int shift = (pin % 10) * 3; // Complete this expression or declaration.
 /* API: writel
+ * Documentation: https://docs.kernel.org/driver-api/device-io.html
  * Write one 32-bit mapped GPIO register. GPSET/GPCLR use one bits to select which output pins change.
  */
 
     /* API: readl(address) and writel(value, address)
+     * Documentation: https://docs.kernel.org/driver-api/device-io.html
      * Read or write one 32-bit hardware register through its mapped address.
      * Clear only this pin's three function bits, then insert its new function.
      */
@@ -100,6 +113,7 @@ static ssize_t led_write(struct file *file, const char __user *buffer, // Pass t
     if (length != 1) return -EINVAL; // Test the condition length != 1. If true, return -einval to the caller.
 
     /* API: copy_from_user(destination, user_address, byte_count)
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * The user buffer belongs to a process. Copy its single binary byte into
      * the kernel. A nonzero return means the copy failed.
      */
@@ -107,6 +121,7 @@ static ssize_t led_write(struct file *file, const char __user *buffer, // Pass t
     if (mask > 0x0F) return -EINVAL; // Only four LED bits are defined.
 
     /* API: mutex_lock / mutex_unlock
+     * Documentation: https://docs.kernel.org/locking/mutex-design.html
      * Only one caller can change the complete LED mask at a time.
      */
     mutex_lock(&led_lock); // Call mutex_lock with the arguments shown here.
@@ -131,6 +146,7 @@ static int __init led_init(void) // Continue the expression or parameter list fr
     struct device *device; // Group the related fields in one plain data record.
 
     /* API: ioremap(physical_address, byte_count)
+     * Documentation: https://docs.kernel.org/driver-api/device-io.html
      * Map the GPIO registers so the kernel can access them. NULL means failure.
      */
     gpio = ioremap(GPIO_BASE, sizeof(struct GpioRegisters)); // Set gpio to ioremap(GPIO_BASE, sizeof(struct GpioRegisters)).
@@ -141,6 +157,7 @@ static int __init led_init(void) // Continue the expression or parameter list fr
     } // End this block, declaration or argument list.
 
     /* API: alloc_chrdev_region / cdev_init / cdev_add
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Reserve a major/minor number, attach our callbacks, then register them.
      * A failed step jumps to cleanup for the steps that already succeeded.
      */
@@ -151,6 +168,7 @@ static int __init led_init(void) // Continue the expression or parameter list fr
     if (result < 0) goto error_number; // Test the condition result < 0. If true, clean up only the resources acquired before this failed startup step.
 
     /* API: class_create / device_create
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Publish the class and character device. devtmpfs/udev creates its node.
      * Our kernel uses class_create(name), unlike the older lecture kernel.
      */
@@ -169,16 +187,19 @@ static int __init led_init(void) // Continue the expression or parameter list fr
 
 error_class: // Cleanup entry used after the corresponding initialization step fails.
     /* API: class_destroy
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Release a registered kernel device class after its device is removed, including failed-startup cleanup.
      */
     class_destroy(led_class); // Call class_destroy with the arguments shown here.
 error_cdev: // Cleanup entry used after the corresponding initialization step fails.
     /* API: cdev_del
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Unregister the character-device callbacks after users can no longer open the published device.
      */
     cdev_del(&led_cdev); // Call cdev_del with the arguments shown here.
 error_number: // Cleanup entry used after the corresponding initialization step fails.
     /* API: unregister_chrdev_region
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Return the major/minor range acquired during module initialization. Only release it after successful allocation.
      */
     unregister_chrdev_region(device_number, 1); // Call unregister_chrdev_region with the arguments shown here.
@@ -194,6 +215,7 @@ static void __exit led_exit(void) // Continue the expression or parameter list f
     unsigned int index; // Complete this expression or declaration.
     // Reverse registration, turn LEDs off and return the pins to input.
     /* API: device_destroy
+     * Documentation: https://docs.kernel.org/core-api/kernel-api.html
      * Remove the character-device node associated with this class and device number before releasing registration.
      */
     device_destroy(led_class, device_number); // Call device_destroy with the arguments shown here.
@@ -204,6 +226,7 @@ static void __exit led_exit(void) // Continue the expression or parameter list f
     for (index = 0; index < 4; index++) set_gpio_function(led_pins[index], 0); // Visit the specified items/indexes in order.
 
     /* API: iounmap(mapped_address)
+     * Documentation: https://docs.kernel.org/driver-api/device-io.html
      * Release the kernel mapping after the final GPIO access.
      */
     iounmap(gpio); // Call iounmap with the arguments shown here.

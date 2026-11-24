@@ -10,6 +10,13 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libudev contexts, device properties, enumeration and hotplug monitoring:
+// https://www.freedesktop.org/software/systemd/man/latest/libudev.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Observe the same block-device event API that Main uses, without mounting anything.
 // Reference: https://www.freedesktop.org/software/systemd/man/latest/udev_monitor_receive_device.html
@@ -24,6 +31,7 @@
 static double monotonic_seconds(void) { // Finish the parameters/condition and enter the block below.
     struct timespec now; // Group the related fields in one plain data record.
     /* API: clock_gettime
+     * Documentation: https://man7.org/linux/man-pages/man3/clock_gettime.3.html
      * Read the selected clock into a timespec. CLOCK_MONOTONIC measures elapsed time; seconds/nanoseconds are used to form absolute wait deadlines.
      */
     clock_gettime(CLOCK_MONOTONIC, &now); // Call clock_gettime with the arguments shown here.
@@ -50,16 +58,19 @@ static int list_devices(struct udev* context) { // Finish the parameters/conditi
         struct udev_device* device = udev_device_new_from_syspath(context, udev_list_entry_get_name(entry)); // Group the related fields in one plain data record.
         if (device == NULL) continue; // Test the condition device == NULL. If true, skip the rest of this pass and check the next loop iteration.
         /* API: udev_device_get_devnode
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Read the block-device path, for example /dev/sda1. Check nullptr before building the FileIO request.
          */
         printf("%s  type=%s  filesystem=%s\n", text(udev_device_get_devnode(device)), // Print the diagnostic or test result for the operator.
                     text(udev_device_get_devtype(device)), // Call text with the arguments shown here.
                     /* API: udev_device_get_property_value
+                     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
                      * Read a named property such as ID_FS_TYPE. The returned string is borrowed; copy it into the mailbox request before unref.
                      */
                     text(udev_device_get_property_value(device, "ID_FS_TYPE"))); // Call text with the arguments shown here.
         count++; // Advance this index/counter for the next item.
         /* API: udev_device_unref
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Release the event-device reference after copying the required fields. Do not keep borrowed strings after this point.
          */
         udev_device_unref(device); // Call udev_device_unref with the arguments shown here.
@@ -71,27 +82,32 @@ static int list_devices(struct udev* context) { // Finish the parameters/conditi
 
 static int watch_devices(struct udev* context, int seconds) { // Finish the parameters/condition and enter the block below.
     /* API: udev_monitor_new_from_netlink
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Subscribe to processed udev events, filter block devices, enable reception,
      * then poll the monitor descriptor. This needs a running udev daemon.
      */
     struct udev_monitor* monitor = udev_monitor_new_from_netlink(context, "udev"); // Group the related fields in one plain data record.
     if (monitor == NULL) return 1; // Test the condition monitor == NULL. If true, return 1 to the caller.
     /* API: udev_monitor_filter_add_match_subsystem_devtype
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Filter monitor events to the required subsystem/device type before receiving. A negative return indicates failure.
      */
     if (udev_monitor_filter_add_match_subsystem_devtype(monitor, "block", NULL) < 0 || // Test the condition udev_monitor_filter_add_match_subsystem_devtype(monitor, "block", NULL) < 0 ||.
         /* API: udev_monitor_enable_receiving
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Enable delivery to the configured monitor. Check the return before asking for its descriptor.
          */
         udev_monitor_enable_receiving(monitor) < 0) { // Call udev_monitor_enable_receiving with the arguments shown here.
         fprintf(stderr, "FAIL: cannot enable the udev monitor\n"); // Print the diagnostic or test result for the operator.
         /* API: udev_monitor_unref
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Release the monitor during teardown, after Main has stopped checking its descriptor.
          */
         udev_monitor_unref(monitor); // Call udev_monitor_unref with the arguments shown here.
         return 1; // Return 1 to the caller.
     } // End this block, declaration or argument list.
     /* API: udev_monitor_get_fd
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Get the monitor's file descriptor for poll(). Poll with zero timeout in Main so USB checking does not block command dispatch.
      */
     int fd = udev_monitor_get_fd(monitor); // Initialize fd to udev_monitor_get_fd(monitor).
@@ -123,6 +139,7 @@ static int watch_devices(struct udev* context, int seconds) { // Finish the para
         struct udev_device* device = udev_monitor_receive_device(monitor); // Group the related fields in one plain data record.
         if (device == NULL) continue; // Test the condition device == NULL. If true, skip the rest of this pass and check the next loop iteration.
         /* API: udev_device_get_action
+         * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
          * Read the event action string such as add/remove/change. The borrowed string may be nullptr and remains tied to this udev device.
          */
         const char* action = udev_device_get_action(device); // Initialize action to udev_device_get_action(device).
@@ -169,6 +186,7 @@ int main(int argc, char** argv) { // Run this standalone test and return success
     if (list) result = list_devices(context); // Test the condition list. If true, set result to list_devices(context).
     else result = watch_devices(context, seconds); // Follow the alternative path when the previous condition is false.
     /* API: udev_unref
+     * Documentation: https://www.freedesktop.org/software/systemd/man/latest/libudev.html
      * Release the libudev context after its monitor is released.
      */
     udev_unref(context); // Call udev_unref with the arguments shown here.

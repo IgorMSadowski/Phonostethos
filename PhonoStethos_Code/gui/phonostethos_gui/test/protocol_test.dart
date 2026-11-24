@@ -8,6 +8,15 @@
  * - _frame(): frame.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// Dart ByteData: explicit-width integers/floats and byte order:
+// https://api.dart.dev/dart-typed_data/ByteData-class.html
+// Flutter testing and matchers:
+// https://api.flutter.dev/flutter/flutter_test/
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 import 'dart:typed_data'; // Import byte arrays and explicit big-endian integer/float access.
 
 import 'package:flutter_test/flutter_test.dart'; // Import Flutter test assertions and test registration.

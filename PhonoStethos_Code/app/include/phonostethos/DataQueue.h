@@ -11,6 +11,15 @@
  * - clear(): discard waiting channel data and reset its state under its owner's rules.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/RuntimeTypes.h" // Include the RuntimeTypes class/types used here; defines shared audio constants, runtime options, telemetry and archive identities.
@@ -38,11 +47,13 @@ public: // The class operations callable by other code.
     // false means it was not stored (mutex busy or no connected GUI).
     bool enqueue(const DataPacket& packet) { // Store an item using this channel's locking and delivery policy.
         /* API: pthread_mutex_trylock
+         * Documentation: https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
          * Try once to take the mutex. A nonzero result means it was not acquired. Audio telemetry can be skipped instead of blocking audio.
          */
         if (pthread_mutex_trylock(&mutex_) != 0) return false; // Busy: skip this attempt without waiting.
         if (!connected_) { // Test the condition !connected_.
             /* API: pthread_mutex_unlock
+             * Documentation: https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
              * Release the mutex so another thread can use the shared object. The caller must own the mutex.
              */
             pthread_mutex_unlock(&mutex_); // Release the slot before returning to audio/network work.

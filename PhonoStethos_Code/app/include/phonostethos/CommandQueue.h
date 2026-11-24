@@ -12,6 +12,17 @@
  * - closed(): closed.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX threads: creation, joining, mutexes and condition variables:
+// https://man7.org/linux/man-pages/man7/pthreads.7.html
+// pthread mutex lock, try-lock and unlock:
+// https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html
+// Condition waits: mutex release/reacquisition and absolute timeouts:
+// https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3p.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include "phonostethos/RuntimeTypes.h" // Include the RuntimeTypes class/types used here; defines shared audio constants, runtime options, telemetry and archive identities.
@@ -104,6 +115,7 @@ public: // The class operations callable by other code.
             queue_.push_back(move(message)); // Append the owned item at the back of this container.
         } // End this block, declaration or argument list.
         /* API: pthread_cond_signal
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Wake one thread waiting on this condition variable. Change the protected condition under its mutex first. The signal itself does not store data.
          */
         pthread_cond_signal(&available_); // Wake one waiter; the protected record or sample buffer stores the actual data.
@@ -118,6 +130,7 @@ public: // The class operations callable by other code.
         const auto deadline = waitDeadline(timeout.count()); // One absolute deadline for this receive.
         while (!closed_ && queue_.empty()) { // Sleep only while there is no item and no close request.
             /* API: pthread_cond_timedwait
+             * Documentation: https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3p.html
              * Sleep until signalled or until an absolute timespec deadline. The mutex must already be held. The call releases it while sleeping and reacquires it before returning. Recheck the predicate after waking.
              */
             const int result = pthread_cond_timedwait( // Release the held mutex while sleeping, then reacquire it before checking the predicate again.
@@ -138,6 +151,7 @@ public: // The class operations callable by other code.
             closed_ = true; // Publish shutdown while holding the same queue mutex.
         } // End this block, declaration or argument list.
         /* API: pthread_cond_broadcast
+         * Documentation: https://man7.org/linux/man-pages/man7/pthreads.7.html
          * Wake all waiters so each can recheck the protected stop/data condition.
          */
         pthread_cond_broadcast(&available_); // Wake all waiters so each can recheck its protected data/stop predicate.

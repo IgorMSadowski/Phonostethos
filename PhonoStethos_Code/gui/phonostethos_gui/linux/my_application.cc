@@ -14,6 +14,19 @@
  * - my_application_new(): provide the GTK/Flutter runner callback my_application_new.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// GTK 3 application/window APIs used by the Linux desktop runner:
+// https://docs.gtk.org/gtk3/
+// GObject type registration, ownership and lifecycle:
+// https://docs.gtk.org/gobject/
+// GApplication registration, activation and process lifecycle:
+// https://docs.gtk.org/gio/class.Application.html
+// Flutter Linux embedder: project/view creation and plugin registration:
+// https://api.flutter.dev/linux-embedder/
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include "my_application.h" // Include the GTK application type implemented by my_application.cc.
 
 #include <flutter_linux/flutter_linux.h> // Include the Flutter Linux engine/view API hosted by GTK.
@@ -112,6 +125,7 @@ static void my_application_shutdown(GApplication* application) { // Finish the p
 
   // Perform any actions required at application shutdown.
 /* API: shutdown
+ * Documentation: https://man7.org/linux/man-pages/man2/shutdown.2.html
  * Disable the selected directions of a connected socket to interrupt/finish transport work. The descriptor still needs close afterward.
  */
 

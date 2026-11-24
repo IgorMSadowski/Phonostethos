@@ -7,6 +7,15 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// libsndfile: SNDFILE/SF_INFO, WAV open, sample I/O, errors and checked close:
+// https://libsndfile.github.io/libsndfile/api.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Create, sync, reopen and verify one WAV. Existing paths are never overwritten.
 // API reference: https://libsndfile.github.io/libsndfile/api.html
@@ -57,6 +66,7 @@ int main(int argc, char** argv) { // Run this standalone test and return success
     info.channels = 1; // Set info.channels to 1.
     info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16; // Set info.format to SF_FORMAT_WAV | SF_FORMAT_PCM_16.
     /* API: sf_open_fd(fd, SFM_WRITE, &info, SF_FALSE)
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * libsndfile writes a valid WAV header. SF_FALSE keeps our POSIX descriptor
      * open after sf_close so we can explicitly check fsync after finalization.
      */
@@ -73,18 +83,22 @@ int main(int argc, char** argv) { // Run this standalone test and return success
     // API: sf_write_short returns the number of samples actually written.
     bool success = sf_write_short(file, samples, 8000) == 8000; // Initialize success to sf_write_short(file, samples, 8000) == 8000.
     /* API: sf_write_sync
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Ask libsndfile to flush pending writes. This function returns void, so check sf_error and the subsequent checked close/synchronization results too.
      */
     sf_write_sync(file); // Force writes and then check the library's error state.
     /* API: sf_error
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Read the libsndfile error associated with a handle. Compare with SF_ERR_NO_ERROR before claiming a write/finalization succeeded.
      */
     if (sf_error(file) != SF_ERR_NO_ERROR) success = false; // Test the condition sf_error(file) != SF_ERR_NO_ERROR. If true, set success to false.
     /* API: sf_close
+     * Documentation: https://libsndfile.github.io/libsndfile/api.html
      * Finalize/release a libsndfile handle. A nonzero result indicates a close/finalization error. This project closes retained POSIX descriptors separately.
      */
     if (sf_close(file) != 0) success = false; // Also finalize the WAV header.
     /* API: fsync
+     * Documentation: https://man7.org/linux/man-pages/man2/fsync.2.html
      * Synchronize this open file descriptor and report 0 or -1 with errno. FileIO checks it before reporting successful recording finalization.
      */
     if (fsync(fd) != 0) success = false; // Include the finalized header in the sync.

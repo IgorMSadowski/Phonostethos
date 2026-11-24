@@ -12,6 +12,15 @@
  * - main(): run this standalone test and return success only if its checks pass.
  */
 
+// API DOCUMENTATION FOR THIS FILE:
+// POSIX TCP socket API; follow the related bind/listen/accept/send/recv pages:
+// https://man7.org/linux/man-pages/man2/socket.2.html
+// POSIX descriptor open/flags; related read/write/close system calls:
+// https://man7.org/linux/man-pages/man2/open.2.html
+// These links document external library/OS APIs; project class methods are
+// implemented in the corresponding project headers and source files.
+
+
 #include <stdbool.h> // Include C bool, true and false.
 // Two-terminal TCP check. Uses port 9090 so it is separate from the real server.
 #include <stdint.h> // Include fixed-width PCM and protocol integer types.
@@ -27,6 +36,7 @@
 static bool set_timeouts(int fd) { // Finish the parameters/condition and enter the block below.
     struct timeval timeout = {3, 0}; // Group the related fields in one plain data record.
     /* API: setsockopt
+     * Documentation: https://man7.org/linux/man-pages/man2/setsockopt.2.html
      * Set the named socket option using a pointer and its exact byte size. Check the return; options here configure reuse and per-call send/receive timeouts.
      */
     return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 && // Return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 && to the caller.
@@ -113,6 +123,7 @@ static int connect_client(const char* host, uint16_t port) { // Finish the param
     address.sin_family = AF_INET; // Set address.sin family to AF_INET.
     address.sin_port = htons(port); // Set address.sin port to htons(port).
     /* API: inet_pton
+     * Documentation: https://man7.org/linux/man-pages/man3/inet_pton.3.html
      * Convert the textual bind address into binary IPv4 form. AF_INET success returns 1; invalid text returns 0 and a call error returns -1.
      */
     if (inet_pton(AF_INET, host, &address.sin_addr) != 1 || !set_timeouts(fd)) { // Test the condition inet_pton(AF_INET, host, &address.sin_addr) != 1 || !set_timeouts(fd).

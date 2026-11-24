@@ -33,6 +33,8 @@
  * - make_data_packet(): serialize data packet with the explicit network layout.
  */
 
+
+
 #pragma once // Compile these declarations once per translation unit, even if included repeatedly.
 
 #include <arpa/inet.h> // Include ntohl, the POSIX network-to-host conversion shown in th_Network.
@@ -195,6 +197,7 @@ inline uint32_t read_u32_be(const uint8_t* bytes) { // Decode the four-byte netw
      */
     memcpy(&network_value, bytes, sizeof(network_value)); // Preserve the received bit pattern.
     /* API: ntohl(network_value)
+     * Documentation: https://man7.org/linux/man-pages/man3/ntohl.3.html
      * Convert an unsigned 32-bit integer from network (big-endian) byte order
      * to this CPU's byte order. It is a pure conversion and reports no error.
      */

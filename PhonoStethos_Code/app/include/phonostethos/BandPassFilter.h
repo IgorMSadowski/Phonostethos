@@ -1,40 +1,93 @@
+#pragma once
 /**
  * BandPassFilter.h - implements the floating-point high-pass/low-pass biquad cascade.
  *
- * CONNECTIONS: DspProcessor owns this header-only filter. It uses the linked W3C Audio EQ Cookbook formulas, normalized by a0, with two biquads per fourth-order Butterworth edge. Filter state persists between samples and is reset at stream/profile transitions.
+ * DspProcessor owns this header-only filter. 
+ * It uses the linked W3C Audio EQ Cookbook formulas, normalized by a0, with two biquads per fourth-order Butterworth edge. 
+ * Filter state persists between samples and is reset at stream/profile transitions.
  *
- * FUNCTIONS:
  * - configure_high_pass(): select the Cookbook high-pass coefficients for one second-order section.
  * - configure_low_pass(): select the Cookbook low-pass coefficients for one second-order section.
  * - reset(): clear processing history so a new stream does not inherit old samples.
  * - process(): advance the persistent IIR state and return one filtered sample.
- * - configure(): calculate normalized biquad coefficients for the selected cutoff/rate/Q.
  */
 
-#pragma once // Compile these declarations once per translation unit, even if included repeatedly.
+
 
 #include <cmath> // Include trigonometry, square roots, logarithms and finite-value checks.
 
-// Coefficient reference: Robert Bristow-Johnson's Audio EQ Cookbook (W3C).
+// Filter design references and their role in this implementation:
+//
+// Robert Bristow-Johnson's Audio EQ Cookbook (W3C):
 // https://www.w3.org/TR/audio-eq-cookbook/
-// We use its LPF (low-pass) and HPF (high-pass) equations, normalized by a0.
-// BandPassFilter combines these sections to keep frequencies between two cutoffs.
+// The equations in configure_high_pass/configure_low_pass come from its HPF/LPF
+// formulas, normalized by a0. C++ calculates the coefficients locally; it does
+// not download coefficients from either website.
+//
+// EarLevel - Cascading filters / Butterworth Q calculator:
+// https://www.earlevel.com/main/2016/09/29/cascading-filters/
+// Selecting order 4 gives the Q pair used by BUTTERWORTH_Q1 and BUTTERWORTH_Q2.
+// Its derivation gives Q1 = 1/(2*cos(pi/8)) and Q2 = 1/(2*cos(3*pi/8)).
+// We use this pair for the two high-pass sections and again for the two low-pass
+// sections, giving each complete edge a fourth-order Butterworth response.
+//
+// EarLevel - Biquad calculator:
+// https://www.earlevel.com/main/2021/09/02/biquad-calculator-v3/
+// This reference tool can inspect one section's coefficients and response.
+// To reproduce a section, select highpass or lowpass, enter sample rate 8000 Hz,
+// its cutoff in Hz, and its Q1 or Q2 value. Our signal passes through four sections.
+// EarLevel names numerator coefficients a and denominator coefficients b;
+// this code uses the Cookbook convention: numerator b, denominator a.
 
-using namespace std; // Allow the names in this namespace without repeating its prefix.
 
-namespace phono_app { // Keep these declarations in the project namespace and avoid global name collisions.
+// Q quality factor controls the damping/resonance of
+// one second-order section around its cutoff. The cutoff itself is specified
+// separately in Hz. A larger Q gives less damping and more peaking in that section.
+// A fourth-order Butterworth edge needs TWO sections with these different Qs.
+// Their combined response is maximally flat in the passband; using Q2 alone
+// would not give the complete Butterworth response. Both HPF and LPF use the pair.
+
+
+#define BUTTERWORTH_Q1 0.541196100146197 // First section: 1 / (2 * cos(pi / 8)).
+#define BUTTERWORTH_Q2 1.306562964876377 // Second section: 1 / (2 * cos(3 * pi / 8)).
+
+using namespace std;
+
+namespace phono_app { 
 // One biquad is a second-order IIR filter. It remembers two previous inputs
 // and two previous outputs, so each new sample can be processed immediately.
 class BiquadFilter { // Declare BiquadFilter and its related operations/state.
 public: // The class operations callable by other code.
     // Reject low frequencies below cutoff. All frequencies are specified in Hz.
     void configure_high_pass(double cutoff, double sample_rate, double q) { // Finish the parameters/condition and enter the block below.
-        configure(cutoff, sample_rate, true, q); // Call configure with the arguments shown here.
+        // Convert the cutoff from Hz into radians per sample: omega = 2*pi*fc/Fs.
+        const double omega = 2.0 * 3.14159265358979323846 * cutoff / sample_rate; // Initialize omega to 2.0 * 3.14159265358979323846 * cutoff / sample_rate.
+        const double cosine = cos(omega); // Initialize cosine to cos(omega).
+        const double alpha = sin(omega) / (2.0 * q); // Initialize alpha to sin(omega) / (2.0 * q).
+        const double a0 = 1.0 + alpha; // Initialize a0 to 1.0 + alpha.
+        // Cookbook HPF: b0 = (1+cos)/2; b1 = -(1+cos), before normalization.
+        b0_ = (1.0 + cosine) / (2.0 * a0); // Set b0 to (1.0 + cosine) / (2.0 * a0).
+        b1_ = -(1.0 + cosine) / a0; // Set b1 to -(1.0 + cosine) / a0.
+        // Normalize the remaining coefficients by a0 so process() needs no division.
+        b2_ = b0_; // Set b2 to b0_.
+        a1_ = -2.0 * cosine / a0; // Set a1 to -2.0 * cosine / a0.
+        a2_ = (1.0 - alpha) / a0; // Set a2 to (1.0 - alpha) / a0.
     } // End this block, declaration or argument list.
 
     // Reject high frequencies above cutoff.
     void configure_low_pass(double cutoff, double sample_rate, double q) { // Finish the parameters/condition and enter the block below.
-        configure(cutoff, sample_rate, false, q); // Call configure with the arguments shown here.
+        // Convert the cutoff from Hz into radians per sample: omega = 2*pi*fc/Fs.
+        const double omega = 2.0 * 3.14159265358979323846 * cutoff / sample_rate; // Initialize omega to 2.0 * 3.14159265358979323846 * cutoff / sample_rate.
+        const double cosine = cos(omega); // Initialize cosine to cos(omega).
+        const double alpha = sin(omega) / (2.0 * q); // Initialize alpha to sin(omega) / (2.0 * q).
+        const double a0 = 1.0 + alpha; // Initialize a0 to 1.0 + alpha.
+        // Cookbook LPF: b0 = (1-cos)/2; b1 = 1-cos, before normalization.
+        b0_ = (1.0 - cosine) / (2.0 * a0); // Set b0 to (1.0 - cosine) / (2.0 * a0).
+        b1_ = (1.0 - cosine) / a0; // Set b1 to (1.0 - cosine) / a0.
+        // Normalize the remaining coefficients by a0 so process() needs no division.
+        b2_ = b0_; // Set b2 to b0_.
+        a1_ = -2.0 * cosine / a0; // Set a1 to -2.0 * cosine / a0.
+        a2_ = (1.0 - alpha) / a0; // Set a2 to (1.0 - alpha) / a0.
     } // End this block, declaration or argument list.
 
     void reset() { // Clear processing history so a new stream does not inherit old samples.
@@ -49,7 +102,7 @@ public: // The class operations callable by other code.
         // Cookbook Direct Form I difference equation:
         // y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2]
         //                  - a1*y[n-1] - a2*y[n-2].
-        // The coefficients already include division by a0 during configure().
+        // The coefficients already include division by a0 during configuration.
         const double output = b0_ * input + b1_ * x1_ + b2_ * x2_ - // Initialize output to b0_ * input + b1_ * x1_ + b2_ * x2_ -.
                               a1_ * y1_ - a2_ * y2_; // Complete this expression or declaration.
         // Shift the saved samples: the current sample becomes the previous one.
@@ -60,33 +113,7 @@ public: // The class operations callable by other code.
         return output; // Return output to the caller.
     } // End this block, declaration or argument list.
 
-private: // Internal helpers and state used by this class.
-    void configure(double cutoff, double sample_rate, bool high_pass, double q) { // Finish the parameters/condition and enter the block below.
-        // cutoff = desired corner frequency; sample_rate = samples per second.
-        // q controls the damping/resonance of this individual second-order section.
-        // Convert the cutoff from Hz into radians per sample: omega = 2*pi*fc/Fs.
-        const double omega = 2.0 * 3.14159265358979323846 * cutoff / sample_rate; // Initialize omega to 2.0 * 3.14159265358979323846 * cutoff / sample_rate.
-        const double cosine = cos(omega); // Initialize cosine to cos(omega).
-        // Cookbook intermediate value for the Q-based coefficient equations.
-        const double alpha = sin(omega) / (2.0 * q); // Initialize alpha to sin(omega) / (2.0 * q).
-        const double a0 = 1.0 + alpha; // Initialize a0 to 1.0 + alpha.
-        // Divide every coefficient by a0 here, so process() needs no division.
-        // Only the numerator coefficients differ between these HPF and LPF forms.
-        if (high_pass) { // Test the condition high_pass.
-            // Cookbook HPF: b0 = (1+cos)/2; b1 = -(1+cos), before normalization.
-            b0_ = (1.0 + cosine) / (2.0 * a0); // Set b0 to (1.0 + cosine) / (2.0 * a0).
-            b1_ = -(1.0 + cosine) / a0; // Set b1 to -(1.0 + cosine) / a0.
-        } else { // Follow the alternative path when the previous condition is false.
-            // Cookbook LPF: b0 = (1-cos)/2; b1 = 1-cos, before normalization.
-            b0_ = (1.0 - cosine) / (2.0 * a0); // Set b0 to (1.0 - cosine) / (2.0 * a0).
-            b1_ = (1.0 - cosine) / a0; // Set b1 to (1.0 - cosine) / a0.
-        } // End this block, declaration or argument list.
-        // Both forms have b2 = b0 and the same denominator coefficients.
-        b2_ = b0_; // Set b2 to b0_.
-        a1_ = -2.0 * cosine / a0; // Set a1 to -2.0 * cosine / a0.
-        a2_ = (1.0 - alpha) / a0; // Set a2 to (1.0 - alpha) / a0.
-    } // End this block, declaration or argument list.
-
+private: // Internal state used by this class.
     // Feedforward coefficients multiply the current and previous input samples.
     double b0_ = 1.0; // Initialize b0 to 1.0.
     double b1_ = 0.0; // Initialize b1 to 0.0.
@@ -101,21 +128,28 @@ private: // Internal helpers and state used by this class.
     double y2_ = 0.0; // Initialize y2 to 0.0.
 }; // End this block, declaration or argument list.
 
+
+
+
+
+
+
+
+
+
+
 // Signal path: HPF section 1 -> HPF section 2 -> LPF section 1 -> LPF section 2.
 // Each edge is fourth order; the complete cascade contains four biquads.
 class BandPassFilter { // Declare BandPassFilter and its related operations/state.
 public: // The class operations callable by other code.
     void configure(double low, double high, double sample_rate) { // Finish the parameters/condition and enter the block below.
         // low is the lower cutoff; high is the upper cutoff, both in Hz.
-        // These Q values come from the fourth-order Butterworth pole positions:
-        // Q1 = 1 / (2*cos(pi/8))   = 0.541196100146197
-        // Q2 = 1 / (2*cos(3*pi/8)) = 1.306562964876377.
-        // Each pair forms a Butterworth edge with a flat passband response.
-        // The Cookbook supplies the biquad equations; Butterworth sets their Qs.
-        high_pass_.configure_high_pass(low, sample_rate, 0.541196100146197); // Call high_pass_.configure_high_pass with the arguments shown here.
-        high_pass_second_.configure_high_pass(low, sample_rate, 1.306562964876377); // Call high_pass_second_.configure_high_pass with the arguments shown here.
-        low_pass_.configure_low_pass(high, sample_rate, 0.541196100146197); // Call low_pass_.configure_low_pass with the arguments shown here.
-        low_pass_second_.configure_low_pass(high, sample_rate, 1.306562964876377); // Call low_pass_second_.configure_low_pass with the arguments shown here.
+        // Use the Butterworth Q pair defined above for both filter edges.
+        // The Cookbook supplies each biquad's equations; these Qs set its damping.
+        high_pass_.configure_high_pass(low, sample_rate, BUTTERWORTH_Q1); // Call high_pass_.configure_high_pass with the arguments shown here.
+        high_pass_second_.configure_high_pass(low, sample_rate, BUTTERWORTH_Q2); // Call high_pass_second_.configure_high_pass with the arguments shown here.
+        low_pass_.configure_low_pass(high, sample_rate, BUTTERWORTH_Q1); // Call low_pass_.configure_low_pass with the arguments shown here.
+        low_pass_second_.configure_low_pass(high, sample_rate, BUTTERWORTH_Q2); // Call low_pass_second_.configure_low_pass with the arguments shown here.
         // Start all four sections with an empty history after reconfiguration.
         reset(); // Clear processing history so a new stream does not inherit old samples.
     } // End this block, declaration or argument list.
